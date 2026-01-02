@@ -1,0 +1,31 @@
+# LLM & AI
+ollama>=0.1.0
+langchain>=0.1.0
+langchain-community>=0.0.20
+
+# Backend
+fastapi>=0.109.0
+uvicorn>=0.27.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-multipart>=0.0.6
+
+# Database
+sqlalchemy>=2.0.25
+alembic>=1.13.0
+
+# Frontend
+streamlit>=1.30.0
+
+# Document Processing
+pypdf2>=3.0.0
+pdfplumber>=0.10.0
+python-docx>=1.1.0
+
+# Vector DB & Embeddings (for RAG)
+sentence-transformers>=2.2.0
+chromadb>=0.4.0
+
+# Utilities
+python-dotenv>=1.0.0
+loguru>=0.7.2
