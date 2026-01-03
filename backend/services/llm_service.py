@@ -4,12 +4,37 @@ from config.settings import settings
 from loguru import logger
 import json
 import time
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+class RateLimiter:
+    """Simple rate limiter to prevent abuse of LLM calls"""
+    def __init__(self, max_calls_per_minute: int = 30):
+        self.max_calls = max_calls_per_minute
+        self.calls = defaultdict(list)
+
+    def is_allowed(self, user_id: str = "default") -> bool:
+        """Check if user is within rate limits"""
+        now = datetime.now()
+        # Clean old calls
+        self.calls[user_id] = [
+            call_time for call_time in self.calls[user_id]
+            if now - call_time < timedelta(minutes=1)
+        ]
+
+        # Check if under limit
+        if len(self.calls[user_id]) >= self.max_calls:
+            return False
+
+        # Record this call
+        self.calls[user_id].append(now)
+        return True
 
 class LLMService:
     """
     Service for interacting with the local LLM via Ollama.
     This is the "brain" that generates questions, explanations, and feedback.
-    
+
     Key Features:
     - Question generation with multiple choice options
     - Concept explanations at different difficulty levels
@@ -17,13 +42,14 @@ class LLMService:
     - Hint generation without revealing answers
     - Retry logic for robustness
     """
-    
+
     def __init__(self):
         self.model = settings.OLLAMA_MODEL
         self.client = ollama.Client(host=settings.OLLAMA_BASE_URL)
         self.max_retries = 3
+        self.rate_limiter = RateLimiter(max_calls_per_minute=30)
         logger.info(f"LLM Service initialized with model: {self.model}")
-        
+
         # Test connection
         try:
             self.client.list()
@@ -31,46 +57,58 @@ class LLMService:
         except Exception as e:
             logger.error(f"✗ Failed to connect to Ollama: {e}")
             logger.error("Make sure Ollama is running with: ollama serve")
-    
+
     def generate_response(
         self,
         prompt: str,
         system_prompt: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 500
+        max_tokens: int = 500,
+        user_id: str = "default"
     ) -> str:
         """
         Generate a response from the LLM.
-        
+
         Args:
             prompt: What to ask the AI
             system_prompt: Instructions for how the AI should behave
             temperature: Creativity level (0=focused, 1=creative)
             max_tokens: Maximum length of response
-        
+            user_id: User identifier for rate limiting
+
         Returns:
             The AI's response as a string
         """
+        # Check rate limits
+        if not self.rate_limiter.is_allowed(user_id):
+            logger.warning(f"Rate limit exceeded for user {user_id}")
+            return "Rate limit exceeded. Please wait a moment before trying again."
+
+        # Validate input length to prevent abuse
+        if len(prompt) > 5000:
+            logger.warning(f"Prompt too long: {len(prompt)} characters")
+            return "Prompt too long. Please keep questions under 5000 characters."
+
         for attempt in range(self.max_retries):
             try:
                 messages = []
-                
+
                 # Add system prompt (instructions for the AI)
                 if system_prompt:
                     messages.append({
                         "role": "system",
                         "content": system_prompt
                     })
-                
+
                 # Add user's question
                 messages.append({
                     "role": "user",
                     "content": prompt
                 })
-                
+
                 # Call Ollama
                 logger.debug(f"Calling Ollama (attempt {attempt + 1}/{self.max_retries})...")
-                
+
                 response = self.client.chat(
                     model=self.model,
                     messages=messages,
@@ -79,11 +117,11 @@ class LLMService:
                         "num_predict": max_tokens
                     }
                 )
-                
+
                 content = response['message']['content']
                 logger.debug(f"✓ Response received ({len(content)} chars)")
                 return content
-            
+
             except Exception as e:
                 logger.error(f"LLM generation error (attempt {attempt + 1}): {e}")
                 if attempt < self.max_retries - 1:
@@ -91,7 +129,7 @@ class LLMService:
                     continue
                 else:
                     return "I apologize, but I'm having trouble generating a response. Please check that Ollama is running and try again."
-    
+
     def generate_question(
         self,
         subject: str,
@@ -101,13 +139,13 @@ class LLMService:
     ) -> Dict:
         """
         Generate a practice question with multiple choice options.
-        
+
         Args:
             subject: e.g., "Python Programming"
             topic: e.g., "Control Flow"
             difficulty: "beginner", "intermediate", or "advanced"
             context: Optional text from study material to base question on
-        
+
         Returns:
             Dictionary with:
             - question: The question text
@@ -115,19 +153,19 @@ class LLMService:
             - correct: The correct answer key (e.g., "A")
             - explanation: Why the answer is correct
         """
-        
+
         # Build context info if studying from material
         context_info = ""
         if context:
             context_info = f"\n\nBase the question on this context from study material:\n{context}\n\nReference specific details from this context in the question."
-        
+
         # Define difficulty-appropriate instructions
         difficulty_instructions = {
             "beginner": "Focus on fundamental concepts and definitions. Use clear, simple language.",
             "intermediate": "Test understanding and application of concepts. Include scenario-based questions.",
             "advanced": "Test deep understanding, edge cases, and complex scenarios. Require critical thinking."
         }
-        
+
         prompt = f"""Generate a {difficulty} level multiple choice practice question about {topic} in {subject}.
 
 {difficulty_instructions.get(difficulty, "")}
@@ -153,13 +191,13 @@ Requirements:
 - Make the explanation educational and thorough
 - Use proper grammar and punctuation"""
 
-        system_prompt = """You are an expert educational content creator. 
+        system_prompt = """You are an expert educational content creator.
 Generate high-quality practice questions that test understanding.
 Return ONLY valid JSON with no markdown formatting, no code blocks, no extra text.
 The response should start with { and end with }."""
-        
+
         response = self.generate_response(prompt, system_prompt, temperature=0.8, max_tokens=800)
-        
+
         # Clean up response (remove markdown code blocks if present)
         response = response.strip()
         if response.startswith("```json"):
@@ -169,28 +207,28 @@ The response should start with { and end with }."""
         if response.endswith("```"):
             response = response[:-3]
         response = response.strip()
-        
+
         # Parse JSON
         try:
             question_data = json.loads(response)
-            
+
             # Validate structure
             required_keys = ["question", "options", "correct", "explanation"]
             if not all(key in question_data for key in required_keys):
                 raise ValueError("Missing required keys in question data")
-            
+
             if not isinstance(question_data["options"], dict):
                 raise ValueError("Options must be a dictionary")
-            
+
             if len(question_data["options"]) != 4:
                 raise ValueError("Must have exactly 4 options")
-            
+
             logger.info(f"✓ Generated question for {subject}/{topic} at {difficulty} level")
             return question_data
-        
+
         except (json.JSONDecodeError, ValueError) as e:
             logger.error(f"Failed to parse question JSON: {e}\nResponse: {response[:200]}...")
-            
+
             # Return a fallback question
             return {
                 "question": f"What is an important concept in {topic}?",
@@ -203,7 +241,7 @@ The response should start with { and end with }."""
                 "correct": "A",
                 "explanation": "This is a fallback question due to a parsing error. Please try restarting your session."
             }
-    
+
     def explain_concept(
         self,
         subject: str,
@@ -213,26 +251,26 @@ The response should start with { and end with }."""
     ) -> str:
         """
         Generate a clear explanation of a concept.
-        
+
         Args:
             subject: The subject area
             topic: The specific topic to explain
             difficulty: Beginner, intermediate, or advanced
             context: Optional material context to reference
-        
+
         Returns:
             A clear, educational explanation
         """
         context_info = ""
         if context:
             context_info = f"\n\nReference this context: {context}"
-        
+
         difficulty_styles = {
             "beginner": "Explain in very simple terms, as if to someone completely new to the subject. Use analogies and everyday examples.",
             "intermediate": "Explain with moderate detail, assuming some background knowledge. Include practical applications.",
             "advanced": "Provide a comprehensive explanation with technical depth, edge cases, and nuanced understanding."
         }
-        
+
         prompt = f"""Explain {topic} in {subject} at a {difficulty} level.
 
 {difficulty_styles.get(difficulty, "")}
@@ -246,11 +284,11 @@ Structure your explanation:
 
 Be clear, encouraging, and educational. Use formatting for readability."""
 
-        system_prompt = """You are a patient, expert tutor who explains concepts clearly. 
+        system_prompt = """You are a patient, expert tutor who explains concepts clearly.
 Your explanations are well-structured, use examples, and leave students feeling confident they understand."""
-        
+
         return self.generate_response(prompt, system_prompt, temperature=0.7, max_tokens=1000)
-    
+
     def evaluate_answer(
         self,
         question: str,
@@ -260,17 +298,17 @@ Your explanations are well-structured, use examples, and leave students feeling 
     ) -> Dict[str, any]:
         """
         Evaluate if a user's answer is correct and provide feedback.
-        
+
         This is more sophisticated than simple string matching - it uses
         the LLM to understand if the answer demonstrates understanding,
         even if worded differently.
-        
+
         Args:
             question: The question asked
             user_answer: What the user answered
             correct_answer: The correct answer
             explanation: The explanation of why it's correct
-        
+
         Returns:
             Dictionary with:
             - is_correct: Boolean
@@ -299,23 +337,23 @@ Return ONLY valid JSON:
   "score": 0.0 to 1.0
 }}"""
 
-        system_prompt = """You are an encouraging tutor evaluating student answers. 
+        system_prompt = """You are an encouraging tutor evaluating student answers.
 Be fair, supportive, and constructive. Help students learn from both correct and incorrect answers.
 Return only valid JSON."""
-        
+
         response = self.generate_response(prompt, system_prompt, temperature=0.3, max_tokens=300)
-        
+
         # Clean and parse JSON
         response = response.strip().replace("```json", "").replace("```", "").strip()
-        
+
         try:
             evaluation = json.loads(response)
             logger.info(f"✓ Evaluated answer: {'correct' if evaluation['is_correct'] else 'incorrect'}")
             return evaluation
-        
+
         except (json.JSONDecodeError, KeyError) as e:
             logger.error(f"Failed to parse evaluation JSON: {e}")
-            
+
             # Fallback: simple string comparison
             is_correct = user_answer.lower().strip() == correct_answer.lower().strip()
             return {
@@ -323,7 +361,7 @@ Return only valid JSON."""
                 "feedback": "Great job!" if is_correct else f"Not quite. The correct answer is {correct_answer}. {explanation}",
                 "score": 1.0 if is_correct else 0.0
             }
-    
+
     def provide_hint(
         self,
         question: str,
@@ -332,12 +370,12 @@ Return only valid JSON."""
     ) -> str:
         """
         Provide a helpful hint without giving away the answer directly.
-        
+
         Args:
             question: The question
             options: Answer options {"A": "text", ...}
             correct_answer: The correct answer key
-        
+
         Returns:
             A helpful hint string
         """
@@ -356,13 +394,13 @@ Give a hint that:
 
 Keep the hint to 2-3 sentences."""
 
-        system_prompt = """You are a helpful tutor providing hints. 
+        system_prompt = """You are a helpful tutor providing hints.
 Guide students without giving direct answers. Help them develop problem-solving skills."""
-        
+
         hint = self.generate_response(prompt, system_prompt, temperature=0.7, max_tokens=200)
         logger.info("✓ Generated hint")
         return hint
-    
+
     def generate_topic_introduction(
         self,
         subject: str,
@@ -371,12 +409,12 @@ Guide students without giving direct answers. Help them develop problem-solving 
     ) -> str:
         """
         Generate a friendly introduction to start a study session.
-        
+
         Args:
             subject: The subject
             topic: The topic
             difficulty: The difficulty level
-        
+
         Returns:
             A welcoming introduction message
         """
@@ -395,7 +433,7 @@ The introduction should:
 Keep it concise and friendly."""
 
         system_prompt = "You are an enthusiastic tutor starting a study session. Be warm, encouraging, and brief."
-        
+
         intro = self.generate_response(prompt, system_prompt, temperature=0.8, max_tokens=200)
         return intro
 
