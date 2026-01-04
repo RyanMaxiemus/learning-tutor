@@ -48,7 +48,7 @@ class LLMService:
         self.client = ollama.Client(host=settings.OLLAMA_BASE_URL)
         self.max_retries = 3
         self.rate_limiter = RateLimiter(max_calls_per_minute=30)
-        logger.info(f"LLM Service initialized with model: {self.model}")
+        logger.info(f"✓ LLM Service initialized with model: {self.model}")
 
         # Test connection
         try:

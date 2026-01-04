@@ -22,7 +22,7 @@ class MaterialProcessor:
 
         # Initialize vector database (stores searchable text)
         self.chroma_client = chromadb.PersistentClient(path=settings.CHROMA_PERSIST_DIR)
-        logger.info("Material processor initialized")
+        logger.info("✓ Material processor initialized")
 
     def calculate_file_hash(self, file_path: Path) -> str:
         """

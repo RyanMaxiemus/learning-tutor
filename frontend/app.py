@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 import json
 from datetime import datetime, timedelta
+from typing import Dict
 import time
 
 # Add backend to Python path so we can import it
@@ -18,60 +19,20 @@ from backend.services.llm_service import llm_service
 from backend.services.progress_tracker import ProgressTracker
 from backend.services.material_processor import material_processor
 from config.settings import settings
+from config.security import (
+    SecurityConfig, validate_file_content, sanitize_input,
+    generate_secure_filename, secure_file_deletion, validate_file_size,
+    log_security_event, SecurityEvents
+)
 from loguru import logger
 import os
 import uuid
 import re
 
-# Security functions
-def _validate_file_content(file_content: bytes, file_extension: str) -> bool:
-    """
-    Validate file content by checking magic bytes/signatures.
-    This prevents malicious files with fake extensions.
-    """
-    # PDF files start with %PDF
-    if file_extension == '.pdf':
-        return file_content.startswith(b'%PDF')
-
-    # DOCX files are ZIP archives with specific structure
-    elif file_extension in ['.docx', '.doc']:
-        # DOCX files start with PK (ZIP signature)
-        if file_extension == '.docx':
-            return file_content.startswith(b'PK')
-        # DOC files have different signature
-        else:
-            return file_content.startswith(b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1')
-
-    # Text files - check if content is valid UTF-8
-    elif file_extension == '.txt':
-        try:
-            file_content.decode('utf-8')
-            return True
-        except UnicodeDecodeError:
-            return False
-
-    return False
-
-def _sanitize_input(text: str, max_length: int = 200) -> str:
-    """
-    Sanitize user input to prevent injection attacks and ensure data integrity.
-    """
-    if not text:
-        return ""
-
-    # Remove potentially dangerous characters
-    text = re.sub(r'[<>"\';\\]', '', text)
-
-    # Limit length
-    text = text[:max_length]
-
-    # Strip whitespace
-    text = text.strip()
-
-    return text
-
-# Initialize database on first run
-init_db()
+# Initialize database on first run (only once per session)
+if 'db_initialized' not in st.session_state:
+    init_db()
+    st.session_state.db_initialized = True
 
 # Configure Streamlit page
 st.set_page_config(
@@ -149,12 +110,39 @@ if 'last_answer_result' not in st.session_state:
 st.sidebar.title("📚 AI Learning Tutor")
 st.sidebar.markdown("---")
 
-# Navigation menu
-page = st.sidebar.radio(
+# Initialize persistent page state
+if 'current_page' not in st.session_state:
+    st.session_state.current_page = "🏠 Home"
+
+# Handle programmatic navigation by checking for navigation requests
+if 'navigate_to' in st.session_state:
+    st.session_state.current_page = st.session_state.navigate_to
+    # Force the radio button to update by clearing its key
+    if 'navigation' in st.session_state:
+        del st.session_state.navigation
+    del st.session_state.navigate_to
+
+# Navigation menu - use index to maintain selection
+page_options = ["🏠 Home", "📖 Study Session", "📚 Study Materials", "📊 Progress Dashboard", "⚙️ Settings"]
+try:
+    current_index = page_options.index(st.session_state.current_page)
+except ValueError:
+    current_index = 0
+    st.session_state.current_page = page_options[0]
+
+selected_page = st.sidebar.radio(
     "Navigate to:",
-    ["🏠 Home", "📖 Study Session", "📚 Study Materials", "📊 Progress Dashboard", "⚙️ Settings"],
+    page_options,
+    index=current_index,
     key="navigation"
 )
+
+# Update persistent state if user manually changed selection
+if selected_page != st.session_state.current_page:
+    st.session_state.current_page = selected_page
+
+# Use the persistent page state
+page = st.session_state.current_page
 
 st.sidebar.markdown("---")
 
@@ -329,21 +317,21 @@ if page == "🏠 Home":
         st.subheader("📖 Start Learning")
         st.write("Begin a new study session")
         if st.button("Start Session", type="primary", use_container_width=True):
-            st.session_state.navigation = "📖 Study Session"
+            st.session_state.navigate_to = "📖 Study Session"
             st.rerun()
 
     with col2:
         st.subheader("📚 Import Materials")
         st.write("Upload your study materials")
         if st.button("Upload Documents", use_container_width=True):
-            st.session_state.navigation = "📚 Study Materials"
+            st.session_state.navigate_to = "📚 Study Materials"
             st.rerun()
 
     with col3:
         st.subheader("📊 View Progress")
         st.write("Track your learning journey")
         if st.button("See Progress", use_container_width=True):
-            st.session_state.navigation = "📊 Progress Dashboard"
+            st.session_state.navigate_to = "📊 Progress Dashboard"
             st.rerun()
 
     st.markdown("---")
@@ -358,7 +346,7 @@ if page == "🏠 Home":
 
     if recent_sessions:
         for session in recent_sessions:
-            col1, col2, col3, col4 = st.columns([3, 2, 2, 2])
+            col1, col2, col3, col4, col5 = st.columns([3, 2, 2, 2, 1])
             with col1:
                 st.write(f"**{session.subject}** - {session.topic}")
             with col2:
@@ -369,6 +357,20 @@ if page == "🏠 Home":
                 st.write(f"{color} {accuracy:.0f}% correct")
             with col4:
                 st.write(f"🗓️ {session.start_time.strftime('%b %d')}")
+            with col5:
+                # Show resume button for incomplete sessions
+                if session.status == "active" or session.questions_answered < settings.QUESTIONS_PER_SESSION:
+                    if st.button("▶️", key=f"home_resume_{session.id}", help="Resume session"):
+                        # Set up session state to resume this session
+                        st.session_state.current_session_id = session.id
+                        st.session_state.questions_asked = session.questions_answered
+                        st.session_state.current_question = None
+                        st.session_state.awaiting_answer = False
+                        st.session_state.selected_material_id = None
+
+                        # Navigate to Study Session page
+                        st.session_state.navigate_to = "📖 Study Session"
+                        st.rerun()
             st.markdown("---")
     else:
         st.info("👋 No recent activity. Start your first session above!")
@@ -577,7 +579,7 @@ elif page == "📖 Study Session":
 
             with col2:
                 if st.button("View Progress Dashboard", use_container_width=True):
-                    st.session_state.navigation = "📊 Progress Dashboard"
+                    st.session_state.navigate_to = "📊 Progress Dashboard"
                     st.rerun()
 
             db.close()
@@ -930,7 +932,7 @@ elif page == "📊 Progress Dashboard":
         ).order_by(SessionModel.start_time.desc()).limit(10).all()
 
         for session in recent_sessions:
-            col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
+            col1, col2, col3, col4, col5 = st.columns([2, 2, 2, 2, 1])
 
             with col1:
                 st.write(f"**{session.topic}**")
@@ -945,6 +947,25 @@ elif page == "📊 Progress Dashboard":
 
             with col4:
                 st.write(f"🗓️ {session.start_time.strftime('%b %d, %I:%M %p')}")
+
+            with col5:
+                # Show resume button for incomplete sessions
+                if session.status == "active" or session.questions_answered < settings.QUESTIONS_PER_SESSION:
+                    if st.button("▶️ Resume", key=f"resume_{session.id}"):
+                        # Set up session state to resume this session
+                        st.session_state.current_session_id = session.id
+                        st.session_state.questions_asked = session.questions_answered
+                        st.session_state.current_question = None
+                        st.session_state.awaiting_answer = False
+                        st.session_state.selected_material_id = None  # Could be enhanced to remember material
+
+                        # Navigate to Study Session page
+                        st.session_state.navigate_to = "📖 Study Session"
+                        st.success(f"✓ Resuming session: {session.subject} - {session.topic}")
+                        time.sleep(1)
+                        st.rerun()
+                else:
+                    st.write("✅ Complete")
 
     db.close()
 
