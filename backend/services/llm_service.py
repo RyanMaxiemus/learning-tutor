@@ -114,7 +114,11 @@ class LLMService:
                     messages=messages,
                     options={
                         "temperature": temperature,
-                        "num_predict": max_tokens
+                        "num_predict": max_tokens,
+                        "top_k": 20,
+                        "top_p": 0.9,
+                        "repeat_penalty": 1.1,
+                        "num_ctx": 1024  # Smaller context for faster processing
                     }
                 )
 
@@ -135,7 +139,8 @@ class LLMService:
         subject: str,
         topic: str,
         difficulty: str,
-        context: Optional[str] = None
+        context: Optional[str] = None,
+        previous_questions: Optional[List[str]] = None
     ) -> Dict:
         """
         Generate a practice question with multiple choice options.
@@ -145,6 +150,7 @@ class LLMService:
             topic: e.g., "Control Flow"
             difficulty: "beginner", "intermediate", or "advanced"
             context: Optional text from study material to base question on
+            previous_questions: A list of recently asked questions to avoid repetition.
 
         Returns:
             Dictionary with:
@@ -159,6 +165,12 @@ class LLMService:
         if context:
             context_info = f"\n\nBase the question on this context from study material:\n{context}\n\nReference specific details from this context in the question."
 
+        # Build history info to prevent repetition
+        history_info = ""
+        if previous_questions:
+            history_str = "\n".join(f"- {q}" for q in previous_questions)
+            history_info = f"\n\nTo ensure variety, do NOT repeat questions or ask questions that are too similar to these recently asked ones:\n{history_str}\n"
+
         # Define difficulty-appropriate instructions
         difficulty_instructions = {
             "beginner": "Focus on fundamental concepts and definitions. Use clear, simple language.",
@@ -166,37 +178,35 @@ class LLMService:
             "advanced": "Test deep understanding, edge cases, and complex scenarios. Require critical thinking."
         }
 
-        prompt = f"""Generate a {difficulty} level multiple choice practice question about {topic} in {subject}.
-
-{difficulty_instructions.get(difficulty, "")}
+        prompt = f"""You are a JSON generation bot. Your only output is a single, valid JSON object. Do not output any other text.
+Generate a multiple choice question based on these parameters:
+- Subject: {subject}
+- Topic: {topic}
+- Difficulty: {difficulty}
+- Do not ask questions similar to these: {previous_questions or "None"}
+{history_info}
 {context_info}
 
-Return ONLY valid JSON with this exact structure (no markdown, no code blocks, no extra text):
+If the question is about a piece of code (e.g., "What is the output of this function?"), you MUST include the code in the "code_snippet" field.
+
+The JSON object must have the following structure. Every value MUST be a JSON string enclosed in double quotes.
 {{
-  "question": "Clear, specific question text here",
+  "question": "A question about {topic}",
+  "code_snippet": "Optional: A string containing a block of code if the question is about code. Use triple backticks for formatting. Can be null if not applicable.",
   "options": {{
-    "A": "First option text",
-    "B": "Second option text",
-    "C": "Third option text",
-    "D": "Fourth option text"
+    "A": "The first possible answer.",
+    "B": "The second possible answer.",
+    "C": "The third possible answer.",
+    "D": "The fourth possible answer."
   }},
-  "correct": "A",
-  "explanation": "Detailed explanation of why the correct answer is right and why others are wrong"
+  "correct": "A string containing only the letter of the correct option (e.g. 'A', 'B', 'C', or 'D').",
+  "explanation": "A string explaining why the correct answer is right. Any newlines in this string must be escaped as \\\\n."
 }}
+"""
 
-Requirements:
-- Make the question clear and unambiguous
-- Create plausible but definitively wrong distractors
-- Ensure exactly ONE correct answer
-- Make the explanation educational and thorough
-- Use proper grammar and punctuation"""
+        system_prompt = """Generate educational multiple choice questions in JSON format only. Be concise."""
 
-        system_prompt = """You are an expert educational content creator.
-Generate high-quality practice questions that test understanding.
-Return ONLY valid JSON with no markdown formatting, no code blocks, no extra text.
-The response should start with { and end with }."""
-
-        response = self.generate_response(prompt, system_prompt, temperature=0.8, max_tokens=800)
+        response = self.generate_response(prompt, system_prompt, temperature=0.7, max_tokens=1200)
 
         # Clean up response (remove markdown code blocks if present)
         response = response.strip()
@@ -210,6 +220,13 @@ The response should start with { and end with }."""
 
         # Parse JSON
         try:
+            # Check if response looks complete (ends with })
+            if not response.strip().endswith('}'):
+                logger.warning(f"Response appears truncated: {response[-50:]}")
+                # Try to fix common truncation issues
+                if response.count('{') > response.count('}'):
+                    response += '}'
+
             question_data = json.loads(response)
 
             # Validate structure
@@ -221,7 +238,7 @@ The response should start with { and end with }."""
                 raise ValueError("Options must be a dictionary")
 
             if len(question_data["options"]) != 4:
-                raise ValueError("Must have exactly 4 options")
+                raise ValueError(f"Must have exactly 4 options, got {len(question_data['options'])}")
 
             logger.info(f"✓ Generated question for {subject}/{topic} at {difficulty} level")
             return question_data
@@ -232,6 +249,7 @@ The response should start with { and end with }."""
             # Return a fallback question
             return {
                 "question": f"What is an important concept in {topic}?",
+                "code_snippet": None,
                 "options": {
                     "A": "Concept A - Please restart the session",
                     "B": "Concept B - There was an error",

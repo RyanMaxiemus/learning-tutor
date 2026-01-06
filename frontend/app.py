@@ -45,6 +45,19 @@ st.set_page_config(
 # Custom CSS for better styling
 st.markdown("""
 <style>
+    @keyframes fadeIn {
+      from { 
+        opacity: 0; 
+        transform: translateY(10px);
+      }
+      to { 
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+    .fade-in-element {
+      animation: fadeIn 0.5s ease-in-out;
+    }
     .stButton>button {
         width: 100%;
     }
@@ -110,39 +123,22 @@ if 'last_answer_result' not in st.session_state:
 st.sidebar.title("📚 AI Learning Tutor")
 st.sidebar.markdown("---")
 
-# Initialize persistent page state
-if 'current_page' not in st.session_state:
-    st.session_state.current_page = "🏠 Home"
+# Unified page navigation state
+if 'page' not in st.session_state:
+    st.session_state.page = "🏠 Home"
 
-# Handle programmatic navigation by checking for navigation requests
-if 'navigate_to' in st.session_state:
-    st.session_state.current_page = st.session_state.navigate_to
-    # Force the radio button to update by clearing its key
-    if 'navigation' in st.session_state:
-        del st.session_state.navigation
-    del st.session_state.navigate_to
-
-# Navigation menu - use index to maintain selection
 page_options = ["🏠 Home", "📖 Study Session", "📚 Study Materials", "📊 Progress Dashboard", "⚙️ Settings"]
-try:
-    current_index = page_options.index(st.session_state.current_page)
-except ValueError:
-    current_index = 0
-    st.session_state.current_page = page_options[0]
 
-selected_page = st.sidebar.radio(
+# The radio button's state is directly tied to `st.session_state.page`.
+# This is the single source of truth for the current page.
+st.sidebar.radio(
     "Navigate to:",
     page_options,
-    index=current_index,
-    key="navigation"
+    key='page',
 )
 
-# Update persistent state if user manually changed selection
-if selected_page != st.session_state.current_page:
-    st.session_state.current_page = selected_page
-
-# Use the persistent page state
-page = st.session_state.current_page
+# Use the unified page state
+page = st.session_state.page
 
 st.sidebar.markdown("---")
 
@@ -170,6 +166,37 @@ if st.session_state.current_session_id:
 db.close()
 
 # ===== HELPER FUNCTIONS =====
+
+def set_page(page_name: str):
+    """Callback function to set the page in session state."""
+    st.session_state.page = page_name
+
+def resume_session_callback(session_id: int):
+    """Callback to set state for resuming a session."""
+    st.session_state.current_session_id = session_id
+
+    db = SessionLocal()
+    session = db.query(SessionModel).filter(SessionModel.id == session_id).first()
+    db.close()
+
+    if session:
+        st.session_state.questions_asked = session.questions_answered
+    else:
+        st.session_state.questions_asked = 0  # Fallback
+
+    st.session_state.current_question = None
+    st.session_state.awaiting_answer = False
+    st.session_state.selected_material_id = None  # Reset selected material
+    st.session_state.page = "📖 Study Session"
+
+
+def start_another_session_callback():
+    """Callback to reset state for a new session."""
+    st.session_state.current_session_id = None
+    st.session_state.current_question = None
+    st.session_state.questions_asked = 0
+    st.session_state.awaiting_answer = False
+
 
 def create_session(subject: str, topic: str, difficulty: str, material_id: int = None) -> int:
     """Create a new study session"""
@@ -231,7 +258,7 @@ def restart_session(session_id: int, new_difficulty: str = None):
     finally:
         db.close()
 
-def generate_next_question(session_id: int, material_id: int = None):
+def generate_next_question(session_id: int, material_id: int = None, previous_questions: list = None):
     """Generate the next question for a session"""
     db = SessionLocal()
     try:
@@ -250,7 +277,8 @@ def generate_next_question(session_id: int, material_id: int = None):
             subject=session.subject,
             topic=session.topic,
             difficulty=session.difficulty_level,
-            context=context
+            context=context,
+            previous_questions=previous_questions
         )
 
         return question_data
@@ -316,23 +344,33 @@ if page == "🏠 Home":
     with col1:
         st.subheader("📖 Start Learning")
         st.write("Begin a new study session")
-        if st.button("Start Session", type="primary", use_container_width=True):
-            st.session_state.navigate_to = "📖 Study Session"
-            st.rerun()
+        st.button(
+            "Start Session",
+            type="primary",
+            use_container_width=True,
+            on_click=set_page,
+            args=("📖 Study Session",)
+        )
 
     with col2:
         st.subheader("📚 Import Materials")
         st.write("Upload your study materials")
-        if st.button("Upload Documents", use_container_width=True):
-            st.session_state.navigate_to = "📚 Study Materials"
-            st.rerun()
+        st.button(
+            "Upload Documents",
+            use_container_width=True,
+            on_click=set_page,
+            args=("📚 Study Materials",)
+        )
 
     with col3:
         st.subheader("📊 View Progress")
         st.write("Track your learning journey")
-        if st.button("See Progress", use_container_width=True):
-            st.session_state.navigate_to = "📊 Progress Dashboard"
-            st.rerun()
+        st.button(
+            "See Progress",
+            use_container_width=True,
+            on_click=set_page,
+            args=("📊 Progress Dashboard",)
+        )
 
     st.markdown("---")
 
@@ -360,17 +398,13 @@ if page == "🏠 Home":
             with col5:
                 # Show resume button for incomplete sessions
                 if session.status == "active" or session.questions_answered < settings.QUESTIONS_PER_SESSION:
-                    if st.button("▶️", key=f"home_resume_{session.id}", help="Resume session"):
-                        # Set up session state to resume this session
-                        st.session_state.current_session_id = session.id
-                        st.session_state.questions_asked = session.questions_answered
-                        st.session_state.current_question = None
-                        st.session_state.awaiting_answer = False
-                        st.session_state.selected_material_id = None
-
-                        # Navigate to Study Session page
-                        st.session_state.navigate_to = "📖 Study Session"
-                        st.rerun()
+                    st.button(
+                        "▶️",
+                        key=f"home_resume_{session.id}",
+                        help="Resume session",
+                        on_click=resume_session_callback,
+                        args=(session.id,)
+                    )
             st.markdown("---")
     else:
         st.info("👋 No recent activity. Start your first session above!")
@@ -505,17 +539,20 @@ elif page == "📖 Study Session":
 
     # Active session - show questions
     else:
+        container = st.container()
+        container.markdown('<div class="fade-in-element">', unsafe_allow_html=True)
+        
         db = SessionLocal()
         session = db.query(SessionModel).filter(SessionModel.id == st.session_state.current_session_id).first()
 
         if not session:
-            st.error("Session not found")
+            container.error("Session not found")
             st.session_state.current_session_id = None
             db.close()
             st.rerun()
 
         # Show session header
-        col1, col2, col3 = st.columns([2, 1, 1])
+        col1, col2, col3 = container.columns([2, 1, 1])
         with col1:
             st.subheader(f"📖 {session.subject}: {session.topic}")
         with col2:
@@ -523,17 +560,17 @@ elif page == "📖 Study Session":
         with col3:
             st.metric("Progress", f"{session.questions_answered}/{settings.QUESTIONS_PER_SESSION}")
 
-        st.markdown("---")
+        container.markdown("---")
 
         # Check if session is complete
         if session.questions_answered >= settings.QUESTIONS_PER_SESSION:
             end_session(st.session_state.current_session_id)
 
-            st.success("🎉 Session Complete!")
-            st.balloons()
+            container.success("🎉 Session Complete!")
+            container.balloons()
 
             # Show results
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3 = container.columns(3)
             with col1:
                 st.metric("Questions Answered", session.questions_answered)
             with col2:
@@ -541,17 +578,17 @@ elif page == "📖 Study Session":
             with col3:
                 st.metric("Final Accuracy", f"{session.accuracy:.0f}%")
 
-            st.markdown("---")
+            container.markdown("---")
 
             # Feedback based on performance
             if session.accuracy >= 90:
-                st.success("🌟 **Outstanding!** You've mastered this topic!")
+                container.success("🌟 **Outstanding!** You've mastered this topic!")
             elif session.accuracy >= 75:
-                st.success("✨ **Great job!** You have a solid understanding!")
+                container.success("✨ **Great job!** You have a solid understanding!")
             elif session.accuracy >= 60:
-                st.info("👍 **Good work!** Keep practicing to improve!")
+                container.info("👍 **Good work!** Keep practicing to improve!")
             else:
-                st.warning("💪 **Keep going!** Consider reviewing this topic again.")
+                container.warning("💪 **Keep going!** Consider reviewing this topic again.")
 
             # Get progress update
             tracker = ProgressTracker(db)
@@ -560,27 +597,30 @@ elif page == "📖 Study Session":
             if progress['topics']:
                 topic_progress = next((t for t in progress['topics'] if t['topic'] == session.topic), None)
                 if topic_progress:
-                    st.info(f"📊 Current mastery of {session.topic}: **{topic_progress['mastery_percentage']:.0f}%**")
+                    container.info(f"📊 Current mastery of {session.topic}: **{topic_progress['mastery_percentage']:.0f}%**")
 
             # Suggest next topic
             next_topic = tracker.suggest_next_topic(st.session_state.user_id, session.subject)
             if next_topic:
-                st.info(f"💡 **Suggested next topic:** {next_topic}")
+                container.info(f"💡 **Suggested next topic:** {next_topic}")
 
             # Action buttons
-            col1, col2 = st.columns(2)
+            col1, col2 = container.columns(2)
             with col1:
-                if st.button("Start Another Session", type="primary", use_container_width=True):
-                    st.session_state.current_session_id = None
-                    st.session_state.current_question = None
-                    st.session_state.questions_asked = 0
-                    st.session_state.awaiting_answer = False
-                    st.rerun()
+                st.button(
+                    "Start Another Session",
+                    type="primary",
+                    use_container_width=True,
+                    on_click=start_another_session_callback
+                )
 
             with col2:
-                if st.button("View Progress Dashboard", use_container_width=True):
-                    st.session_state.navigate_to = "📊 Progress Dashboard"
-                    st.rerun()
+                st.button(
+                    "View Progress Dashboard",
+                    use_container_width=True,
+                    on_click=set_page,
+                    args=("📊 Progress Dashboard",)
+                )
 
             db.close()
             st.stop()
@@ -588,9 +628,16 @@ elif page == "📖 Study Session":
         # Generate new question if needed
         if st.session_state.current_question is None:
             with st.spinner("🤔 Generating question..."):
+                # Fetch previous questions to ensure variety
+                previous_interactions = db.query(Interaction).filter(
+                    Interaction.session_id == st.session_state.current_session_id
+                ).order_by(Interaction.timestamp.desc()).limit(5).all()
+                previous_questions = [inter.question for inter in previous_interactions]
+
                 question = generate_next_question(
                     st.session_state.current_session_id,
-                    st.session_state.selected_material_id
+                    st.session_state.selected_material_id,
+                    previous_questions=previous_questions
                 )
                 st.session_state.current_question = question
                 st.session_state.question_start_time = time.time()
@@ -600,20 +647,38 @@ elif page == "📖 Study Session":
         # Display question
         question = st.session_state.current_question
 
-        st.write(f"**Question {session.questions_answered + 1} of {settings.QUESTIONS_PER_SESSION}:**")
-        st.write(f"### {question['question']}")
-
-        # Show last answer result if exists
-        if st.session_state.last_answer_result:
+                    container.write(f"**Question {session.questions_answered + 1} of {settings.QUESTIONS_PER_SESSION}:**")
+                    container.write(f"### {question['question']}")
+        
+                    if 'code_snippet' in question and question['code_snippet'] and question['code_snippet'] != 'null':
+                        # Clean up code snippet from markdown and quotes
+                        code_snippet = question['code_snippet']
+                        if code_snippet.startswith("```python"):
+                            code_snippet = code_snippet[9:]
+                        if code_snippet.startswith("```"):
+                            code_snippet = code_snippet[3:]
+                        if code_snippet.endswith("```"):
+                            code_snippet = code_snippet[:-3]
+                        
+                        # Also remove wrapping quotes if they exist from the JSON string
+                        if code_snippet.startswith('"') and code_snippet.endswith('"'):
+                            code_snippet = code_snippet[1:-1]
+                        
+                        # Unescape newlines
+                        code_snippet = code_snippet.replace('\\n', '\n').replace('\\"', '"')
+                        
+                        container.code(code_snippet.strip(), language='python')
+            
+                    # Show last answer result if exists        if st.session_state.last_answer_result:
             result = st.session_state.last_answer_result
             if result['is_correct']:
-                st.success(f"✅ {result['feedback']}")
+                container.success(f"✅ {result['feedback']}")
             else:
-                st.error(f"❌ {result['feedback']}")
-            st.info(f"💡 {question['explanation']}")
+                container.error(f"❌ {result['feedback']}")
+            container.info(f"💡 {question['explanation']}")
 
             # Next question button
-            if st.button("➡️ Next Question", type="primary", use_container_width=True):
+            if container.button("➡️ Next Question", type="primary", use_container_width=True):
                 st.session_state.current_question = None
                 st.session_state.awaiting_answer = False
                 st.session_state.last_answer_result = None
@@ -621,43 +686,68 @@ elif page == "📖 Study Session":
 
         # Show answer options if waiting for answer
         elif st.session_state.awaiting_answer:
-            st.write("**Select your answer:**")
+            with container.form(key="answer_form"):
+                # Ensure options are sorted alphabetically by key (A, B, C, D) for consistent order
+                try:
+                    sorted_options = sorted(question['options'].items())
+                except (TypeError, AttributeError):
+                    sorted_options = list(question['options'].items() if isinstance(question.get('options'), dict) else [])
 
-            # Create buttons for each option
-            for option_key, option_text in question['options'].items():
-                if st.button(f"{option_key}: {option_text}", key=f"option_{option_key}", use_container_width=True):
-                    # Calculate response time
-                    response_time = int(time.time() - st.session_state.question_start_time)
-
-                    # Check if correct
-                    is_correct = (option_key == question['correct'])
-
-                    # Evaluate with LLM for better feedback
-                    evaluation = llm_service.evaluate_answer(
-                        question=question['question'],
-                        user_answer=option_text,
-                        correct_answer=question['options'][question['correct']],
-                        explanation=question['explanation']
+                if not sorted_options:
+                    st.error("Question options are invalid or missing. Please try the next question.")
+                else:
+                    option_list = [f"{key}: {text}" for key, text in sorted_options]
+                    
+                    selected_option_str = st.radio(
+                        "**Select your answer:**",
+                        options=option_list,
+                        index=None,  # No default selection
+                        key="answer_selection"
                     )
+                    
+                    submitted = st.form_submit_button("Submit Answer", use_container_width=True, type="primary")
 
-                    # Record answer
-                    record_answer(
-                        st.session_state.current_session_id,
-                        question,
-                        option_key,
-                        is_correct,
-                        response_time
-                    )
+                    if submitted:
+                        if selected_option_str:
+                            with st.spinner("Checking your answer..."):
+                                # Extract key and text from selection
+                                option_key = selected_option_str.split(':', 1)[0]
+                                option_text = selected_option_str.split(':', 1)[1].strip()
 
-                    # Store result
-                    st.session_state.last_answer_result = evaluation
-                    st.session_state.awaiting_answer = False
-                    st.rerun()
+                                # Calculate response time
+                                response_time = int(time.time() - st.session_state.question_start_time)
 
-            st.markdown("---")
+                                # Check if correct
+                                is_correct = (option_key == question['correct'])
+
+                                # Evaluate with LLM for better feedback
+                                evaluation = llm_service.evaluate_answer(
+                                    question=question['question'],
+                                    user_answer=option_text,
+                                    correct_answer=question['options'][question['correct']],
+                                    explanation=question['explanation']
+                                )
+
+                                # Record answer
+                                record_answer(
+                                    st.session_state.current_session_id,
+                                    question,
+                                    option_key,
+                                    is_correct,
+                                    response_time
+                                )
+
+                                # Store result
+                                st.session_state.last_answer_result = evaluation
+                                st.session_state.awaiting_answer = False
+                            st.rerun()
+                        else:
+                            st.warning("Please select an answer before submitting.", icon="⚠️")
+
+            container.markdown("---")
 
             # Help options
-            col1, col2 = st.columns(2)
+            col1, col2 = container.columns(2)
             with col1:
                 if st.button("💡 Get a Hint", use_container_width=True):
                     hint = llm_service.provide_hint(
@@ -675,9 +765,9 @@ elif page == "📖 Study Session":
                         session.difficulty_level
                     )
                     st.info(explanation)
-
+        
+        container.markdown('</div>', unsafe_allow_html=True)
         db.close()
-
 # ===== PAGE: STUDY MATERIALS =====
 
 elif page == "📚 Study Materials":
@@ -951,19 +1041,12 @@ elif page == "📊 Progress Dashboard":
             with col5:
                 # Show resume button for incomplete sessions
                 if session.status == "active" or session.questions_answered < settings.QUESTIONS_PER_SESSION:
-                    if st.button("▶️ Resume", key=f"resume_{session.id}"):
-                        # Set up session state to resume this session
-                        st.session_state.current_session_id = session.id
-                        st.session_state.questions_asked = session.questions_answered
-                        st.session_state.current_question = None
-                        st.session_state.awaiting_answer = False
-                        st.session_state.selected_material_id = None  # Could be enhanced to remember material
-
-                        # Navigate to Study Session page
-                        st.session_state.navigate_to = "📖 Study Session"
-                        st.success(f"✓ Resuming session: {session.subject} - {session.topic}")
-                        time.sleep(1)
-                        st.rerun()
+                    st.button(
+                        "▶️ Resume",
+                        key=f"resume_{session.id}",
+                        on_click=resume_session_callback,
+                        args=(session.id,)
+                    )
                 else:
                     st.write("✅ Complete")
 
