@@ -46,11 +46,11 @@ st.set_page_config(
 st.markdown("""
 <style>
     @keyframes fadeIn {
-      from { 
-        opacity: 0; 
+      from {
+        opacity: 0;
         transform: translateY(10px);
       }
-      to { 
+      to {
         opacity: 1;
         transform: translateY(0);
       }
@@ -541,7 +541,7 @@ elif page == "📖 Study Session":
     else:
         container = st.container()
         container.markdown('<div class="fade-in-element">', unsafe_allow_html=True)
-        
+
         db = SessionLocal()
         session = db.query(SessionModel).filter(SessionModel.id == st.session_state.current_session_id).first()
 
@@ -647,29 +647,30 @@ elif page == "📖 Study Session":
         # Display question
         question = st.session_state.current_question
 
-                    container.write(f"**Question {session.questions_answered + 1} of {settings.QUESTIONS_PER_SESSION}:**")
-                    container.write(f"### {question['question']}")
-        
-                    if 'code_snippet' in question and question['code_snippet'] and question['code_snippet'] != 'null':
-                        # Clean up code snippet from markdown and quotes
-                        code_snippet = question['code_snippet']
-                        if code_snippet.startswith("```python"):
-                            code_snippet = code_snippet[9:]
-                        if code_snippet.startswith("```"):
-                            code_snippet = code_snippet[3:]
-                        if code_snippet.endswith("```"):
-                            code_snippet = code_snippet[:-3]
-                        
-                        # Also remove wrapping quotes if they exist from the JSON string
-                        if code_snippet.startswith('"') and code_snippet.endswith('"'):
-                            code_snippet = code_snippet[1:-1]
-                        
-                        # Unescape newlines
-                        code_snippet = code_snippet.replace('\\n', '\n').replace('\\"', '"')
-                        
-                        container.code(code_snippet.strip(), language='python')
-            
-                    # Show last answer result if exists        if st.session_state.last_answer_result:
+        container.write(f"**Question {session.questions_answered + 1} of {settings.QUESTIONS_PER_SESSION}:**")
+        container.write(f"### {question['question']}")
+
+        if 'code_snippet' in question and question['code_snippet'] and question['code_snippet'] != 'null':
+            # Clean up code snippet from markdown and quotes
+            code_snippet = question['code_snippet']
+            if code_snippet.startswith("```python"):
+                code_snippet = code_snippet[9:]
+            if code_snippet.startswith("```"):
+                code_snippet = code_snippet[3:]
+            if code_snippet.endswith("```"):
+                code_snippet = code_snippet[:-3]
+
+            # Also remove wrapping quotes if they exist from the JSON string
+            if code_snippet.startswith('"') and code_snippet.endswith('"'):
+                code_snippet = code_snippet[1:-1]
+
+            # Unescape newlines
+            code_snippet = code_snippet.replace('\\n', '\n').replace('\\"', '"')
+
+            container.code(code_snippet.strip(), language='python')
+
+        # Show last answer result if exists
+        if st.session_state.last_answer_result:
             result = st.session_state.last_answer_result
             if result['is_correct']:
                 container.success(f"✅ {result['feedback']}")
@@ -697,14 +698,14 @@ elif page == "📖 Study Session":
                     st.error("Question options are invalid or missing. Please try the next question.")
                 else:
                     option_list = [f"{key}: {text}" for key, text in sorted_options]
-                    
+
                     selected_option_str = st.radio(
                         "**Select your answer:**",
                         options=option_list,
                         index=None,  # No default selection
                         key="answer_selection"
                     )
-                    
+
                     submitted = st.form_submit_button("Submit Answer", use_container_width=True, type="primary")
 
                     if submitted:
@@ -765,7 +766,7 @@ elif page == "📖 Study Session":
                         session.difficulty_level
                     )
                     st.info(explanation)
-        
+
         container.markdown('</div>', unsafe_allow_html=True)
         db.close()
 # ===== PAGE: STUDY MATERIALS =====
