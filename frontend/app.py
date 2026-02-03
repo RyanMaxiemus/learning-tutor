@@ -639,6 +639,17 @@ elif page == "📖 Study Session":
                     st.session_state.selected_material_id,
                     previous_questions=previous_questions
                 )
+
+                # If generation failed, show error and retry option (do not store as current_question)
+                if question.get("_generation_failed"):
+                    container.error("⚠️ **Question could not be generated**")
+                    container.markdown(question.get("message", "Something went wrong. Please try again."))
+                    if container.button("🔄 Try again", type="primary", use_container_width=True):
+                        st.rerun()
+                    container.markdown("---")
+                    db.close()
+                    st.stop()
+
                 st.session_state.current_question = question
                 st.session_state.question_start_time = time.time()
                 st.session_state.awaiting_answer = True
@@ -646,6 +657,16 @@ elif page == "📖 Study Session":
 
         # Display question
         question = st.session_state.current_question
+
+        # Guard: if we ever have a failed-question in state, show retry (shouldn't happen after above fix)
+        if question.get("_generation_failed"):
+            container.error("⚠️ **Question could not be generated**")
+            container.markdown(question.get("message", "Something went wrong. Please try again."))
+            if container.button("🔄 Try again", type="primary", use_container_width=True):
+                st.session_state.current_question = None
+                st.rerun()
+            db.close()
+            st.stop()
 
         container.write(f"**Question {session.questions_answered + 1} of {settings.QUESTIONS_PER_SESSION}:**")
         container.write(f"### {question['question']}")
@@ -718,16 +739,23 @@ elif page == "📖 Study Session":
                                 # Calculate response time
                                 response_time = int(time.time() - st.session_state.question_start_time)
 
-                                # Check if correct
+                                # Check if correct (instant for multiple choice)
                                 is_correct = (option_key == question['correct'])
 
-                                # Evaluate with LLM for better feedback
-                                evaluation = llm_service.evaluate_answer(
-                                    question=question['question'],
-                                    user_answer=option_text,
-                                    correct_answer=question['options'][question['correct']],
-                                    explanation=question['explanation']
-                                )
+                                # Use instant feedback for correct answers; LLM only for wrong (personalized feedback)
+                                if is_correct:
+                                    evaluation = {
+                                        "is_correct": True,
+                                        "feedback": "Correct! Well done.",
+                                        "score": 1.0
+                                    }
+                                else:
+                                    evaluation = llm_service.evaluate_answer(
+                                        question=question['question'],
+                                        user_answer=option_text,
+                                        correct_answer=question['options'][question['correct']],
+                                        explanation=question['explanation']
+                                    )
 
                                 # Record answer
                                 record_answer(
@@ -818,7 +846,7 @@ elif page == "📚 Study Materials":
 
                 # Validate file type by content, not just extension
                 file_content = uploaded_file.getbuffer()
-                if not _validate_file_content(file_content, file_extension):
+                if not validate_file_content(file_content, file_extension):
                     st.error("❌ Invalid file type or corrupted file.")
                     st.stop()
 

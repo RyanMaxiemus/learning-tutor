@@ -206,59 +206,56 @@ The JSON object must have the following structure. Every value MUST be a JSON st
 
         system_prompt = """Generate educational multiple choice questions in JSON format only. Be concise."""
 
-        response = self.generate_response(prompt, system_prompt, temperature=0.7, max_tokens=1200)
-
-        # Clean up response (remove markdown code blocks if present)
-        response = response.strip()
-        if response.startswith("```json"):
-            response = response[7:]
-        if response.startswith("```"):
-            response = response[3:]
-        if response.endswith("```"):
-            response = response[:-3]
-        response = response.strip()
-
-        # Parse JSON
-        try:
-            # Check if response looks complete (ends with })
-            if not response.strip().endswith('}'):
-                logger.warning(f"Response appears truncated: {response[-50:]}")
-                # Try to fix common truncation issues
-                if response.count('{') > response.count('}'):
-                    response += '}'
-
-            question_data = json.loads(response)
-
-            # Validate structure
+        def _parse_response(raw: str):
+            """Clean and parse LLM response; raises on failure."""
+            text = raw.strip()
+            if text.startswith("```json"):
+                text = text[7:]
+            if text.startswith("```"):
+                text = text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+            if not text.endswith('}'):
+                if text.count('{') > text.count('}'):
+                    text += '}'
+            data = json.loads(text)
             required_keys = ["question", "options", "correct", "explanation"]
-            if not all(key in question_data for key in required_keys):
+            if not all(key in data for key in required_keys):
                 raise ValueError("Missing required keys in question data")
-
-            if not isinstance(question_data["options"], dict):
+            if not isinstance(data.get("options"), dict):
                 raise ValueError("Options must be a dictionary")
+            opts = data["options"]
+            if len(opts) < 3 or len(opts) > 4:
+                raise ValueError(f"Must have 3 or 4 options, got {len(opts)}")
+            correct_key = data.get("correct")
+            if correct_key not in opts:
+                raise ValueError(f"correct must be one of the option keys {list(opts.keys())}")
+            data["correct"] = correct_key
+            return data
 
-            if len(question_data["options"]) != 4:
-                raise ValueError(f"Must have exactly 4 options, got {len(question_data['options'])}")
+        for attempt in range(2):  # Try up to 2 times (initial + 1 retry)
+            response = self.generate_response(prompt, system_prompt, temperature=0.7, max_tokens=1200)
 
-            logger.info(f"✓ Generated question for {subject}/{topic} at {difficulty} level")
-            return question_data
+            # Skip retry if we got a rate-limit or error message instead of JSON
+            if response.startswith("Rate limit") or response.startswith("Prompt too long"):
+                return {"_generation_failed": True, "message": response}
+            if response.startswith("I apologize") or "trouble generating" in response:
+                return {"_generation_failed": True, "message": "The AI service couldn't generate a response. Check that Ollama is running and try again."}
 
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.error(f"Failed to parse question JSON: {e}\nResponse: {response[:200]}...")
-
-            # Return a fallback question
-            return {
-                "question": f"What is an important concept in {topic}?",
-                "code_snippet": None,
-                "options": {
-                    "A": "Concept A - Please restart the session",
-                    "B": "Concept B - There was an error",
-                    "C": "Concept C - Generating the question",
-                    "D": "Concept D - Try again"
-                },
-                "correct": "A",
-                "explanation": "This is a fallback question due to a parsing error. Please try restarting your session."
-            }
+            try:
+                question_data = _parse_response(response)
+                logger.info(f"✓ Generated question for {subject}/{topic} at {difficulty} level")
+                return question_data
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"Parse attempt {attempt + 1} failed: {e}\nResponse: {response[:200]}...")
+                if attempt == 0:
+                    continue  # Retry once
+                logger.error(f"Failed to parse question JSON after retry: {e}")
+                return {
+                    "_generation_failed": True,
+                    "message": "We couldn't generate a valid question (the AI returned invalid data). Click **Try again** to generate another question."
+                }
 
     def explain_concept(
         self,
@@ -359,13 +356,22 @@ Return ONLY valid JSON:
 Be fair, supportive, and constructive. Help students learn from both correct and incorrect answers.
 Return only valid JSON."""
 
-        response = self.generate_response(prompt, system_prompt, temperature=0.3, max_tokens=300)
+        response = self.generate_response(prompt, system_prompt, temperature=0.3, max_tokens=150)
 
         # Clean and parse JSON
         response = response.strip().replace("```json", "").replace("```", "").strip()
 
         try:
             evaluation = json.loads(response)
+            # Normalize is_correct (LLM may return string "true"/"false")
+            is_correct = evaluation.get("is_correct", False)
+            if isinstance(is_correct, str):
+                is_correct = is_correct.lower() in ("true", "1", "yes")
+            evaluation["is_correct"] = bool(is_correct)
+            evaluation["score"] = float(evaluation.get("score", 1.0 if is_correct else 0.0))
+            evaluation["feedback"] = str(evaluation.get("feedback", "")) or (
+                "Great job!" if is_correct else f"Not quite. The correct answer is {correct_answer}. {explanation}"
+            )
             logger.info(f"✓ Evaluated answer: {'correct' if evaluation['is_correct'] else 'incorrect'}")
             return evaluation
 

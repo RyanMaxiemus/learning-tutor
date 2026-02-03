@@ -48,12 +48,16 @@ def validate_file_content(file_content: bytes, file_extension: str) -> bool:
     This prevents malicious files with fake extensions.
 
     Args:
-        file_content: Raw file bytes
+        file_content: Raw file bytes (or memoryview from e.g. Streamlit upload)
         file_extension: File extension (e.g., '.pdf')
 
     Returns:
         True if file is valid, False otherwise
     """
+    # Normalize to bytes (Streamlit's getbuffer() returns memoryview, which has no startswith)
+    if not isinstance(file_content, bytes):
+        file_content = bytes(file_content)
+
     if file_extension not in SecurityConfig.ALLOWED_FILE_TYPES:
         logger.warning(f"Unsupported file extension: {file_extension}")
         return False
