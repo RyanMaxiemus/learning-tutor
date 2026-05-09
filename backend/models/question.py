@@ -28,3 +28,5 @@ class Progress(Base):
     mastery_level = Column(Float, nullable=False, default=0.0)  # 0.0 to 1.0
     times_practiced = Column(Integer, nullable=False, default=0)
     last_practiced = Column(DateTime(timezone=True), nullable=True)
+    next_review_date = Column(DateTime(timezone=True), nullable=True)
+    interval = Column(Integer, nullable=False, default=1)

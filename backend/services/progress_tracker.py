@@ -103,6 +103,20 @@ class ProgressTracker:
             progress.times_practiced += 1
             progress.last_practiced = datetime.utcnow()
             
+            # SRS (Spaced Repetition System) Interval calculation
+            if is_correct:
+                if progress.times_practiced == 1:
+                    progress.interval = 1
+                elif progress.times_practiced == 2:
+                    progress.interval = 6
+                else:
+                    progress.interval = int(progress.interval * 2.5) # SM-2 standard multiplier
+            else:
+                progress.interval = 1 # Reset interval if wrong
+            
+            # Set next review date
+            progress.next_review_date = datetime.utcnow() + timedelta(days=progress.interval)
+            
             # Commit changes
             self.db.commit()
             
@@ -222,7 +236,19 @@ class ProgressTracker:
             Topic name to study next, or None if all mastered
         """
         try:
-            # Get all progress, ordered by mastery (lowest first)
+            # First priority: SRS due dates
+            now = datetime.utcnow()
+            due_topics = self.db.query(Progress).filter(
+                Progress.user_id == user_id,
+                Progress.subject == subject,
+                Progress.next_review_date <= now
+            ).order_by(Progress.next_review_date.asc()).all()
+            
+            if due_topics:
+                logger.info(f"Suggested next topic (SRS Due): {due_topics[0].topic}")
+                return due_topics[0].topic
+
+            # Second priority: Get all progress, ordered by mastery (lowest first)
             progress_records = self.db.query(Progress).filter(
                 Progress.user_id == user_id,
                 Progress.subject == subject
@@ -231,11 +257,11 @@ class ProgressTracker:
             # Find first topic that needs practice (< 80% mastery)
             for progress in progress_records:
                 if progress.mastery_level < 0.8:
-                    logger.info(f"Suggested next topic: {progress.topic} ({progress.mastery_level:.1%} mastery)")
+                    logger.info(f"Suggested next topic (Mastery): {progress.topic} ({progress.mastery_level:.1%} mastery)")
                     return progress.topic
             
-            # All topics mastered
-            logger.info(f"All topics in {subject} are mastered!")
+            # All topics mastered and nothing due
+            logger.info(f"All topics in {subject} are mastered and no reviews due!")
             return None
         
         except Exception as e:
@@ -343,8 +369,8 @@ class ProgressTracker:
                 "accuracy": session.accuracy,
                 "total_time_seconds": total_time,
                 "average_time_per_question": round(avg_time, 1),
-                "fastest_answer": min((i.response_time_seconds for i in interactions if i.response_time_seconds), default=0),
-                "slowest_answer": max((i.response_time_seconds for i in interactions if i.response_time_seconds), default=0),
+                "fastest_answer": min([i.response_time_seconds for i in interactions if i.response_time_seconds] or [0]),
+                "slowest_answer": max([i.response_time_seconds for i in interactions if i.response_time_seconds] or [0]),
                 "first_half_accuracy": round(first_half_accuracy, 1),
                 "second_half_accuracy": round(second_half_accuracy, 1),
                 "improvement": round(improvement, 1),

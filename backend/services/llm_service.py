@@ -1,4 +1,5 @@
 import ollama
+import asyncio
 from typing import List, Dict, Optional
 from config.settings import settings
 from loguru import logger
@@ -33,32 +34,16 @@ class RateLimiter:
 class LLMService:
     """
     Service for interacting with the local LLM via Ollama.
-    This is the "brain" that generates questions, explanations, and feedback.
-
-    Key Features:
-    - Question generation with multiple choice options
-    - Concept explanations at different difficulty levels
-    - Answer evaluation with detailed feedback
-    - Hint generation without revealing answers
-    - Retry logic for robustness
     """
 
     def __init__(self):
         self.model = settings.OLLAMA_MODEL
-        self.client = ollama.Client(host=settings.OLLAMA_BASE_URL)
+        self.client = ollama.AsyncClient(host=settings.OLLAMA_BASE_URL)
         self.max_retries = 3
         self.rate_limiter = RateLimiter(max_calls_per_minute=30)
-        logger.info(f"✓ LLM Service initialized with model: {self.model}")
+        logger.info(f"✓ Async LLM Service initialized with model: {self.model}")
 
-        # Test connection
-        try:
-            self.client.list()
-            logger.info("✓ Successfully connected to Ollama")
-        except Exception as e:
-            logger.error(f"✗ Failed to connect to Ollama: {e}")
-            logger.error("Make sure Ollama is running with: ollama serve")
-
-    def generate_response(
+    async def generate_response(
         self,
         prompt: str,
         system_prompt: Optional[str] = None,
@@ -109,7 +94,7 @@ class LLMService:
                 # Call Ollama
                 logger.debug(f"Calling Ollama (attempt {attempt + 1}/{self.max_retries})...")
 
-                response = self.client.chat(
+                response = await self.client.chat(
                     model=self.model,
                     messages=messages,
                     options={
@@ -129,12 +114,52 @@ class LLMService:
             except Exception as e:
                 logger.error(f"LLM generation error (attempt {attempt + 1}): {e}")
                 if attempt < self.max_retries - 1:
-                    time.sleep(1)  # Wait before retry
+                    await asyncio.sleep(1)  # Wait before retry
                     continue
                 else:
                     return "I apologize, but I'm having trouble generating a response. Please check that Ollama is running and try again."
 
-    def generate_question(
+    async def generate_response_stream(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 500,
+        user_id: str = "default"
+    ):
+        if not self.rate_limiter.is_allowed(user_id):
+            yield "Rate limit exceeded. Please wait a moment before trying again."
+            return
+
+        if len(prompt) > 5000:
+            yield "Prompt too long. Please keep questions under 5000 characters."
+            return
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        try:
+            async for chunk in await self.client.chat(
+                model=self.model,
+                messages=messages,
+                stream=True,
+                options={
+                    "temperature": temperature,
+                    "num_predict": max_tokens,
+                    "top_k": 20,
+                    "top_p": 0.9,
+                    "repeat_penalty": 1.1,
+                    "num_ctx": 1024
+                }
+            ):
+                yield chunk['message']['content']
+        except Exception as e:
+            logger.error(f"Stream error: {e}")
+            yield " [Connection error, generation halted]"
+
+    async def generate_question(
         self,
         subject: str,
         topic: str,
@@ -171,25 +196,14 @@ class LLMService:
             history_str = "\n".join(f"- {q}" for q in previous_questions)
             history_info = f"\n\nTo ensure variety, do NOT repeat questions or ask questions that are too similar to these recently asked ones:\n{history_str}\n"
 
-        # Define difficulty-appropriate instructions
         difficulty_instructions = {
             "beginner": "Focus on fundamental concepts and definitions. Use clear, simple language.",
             "intermediate": "Test understanding and application of concepts. Include scenario-based questions.",
-            "advanced": "Test deep understanding, edge cases, and complex scenarios. Require critical thinking."
+            "advanced": "Test deep understanding, edge cases, and complex scenarios. Require critical thinking.",
+            "socratic": "Ask an open-ended, thought-provoking question that requires the student to explain their reasoning. Do NOT provide multiple choice options."
         }
 
-        prompt = f"""You are a JSON generation bot. Your only output is a single, valid JSON object. Do not output any other text.
-Generate a multiple choice question based on these parameters:
-- Subject: {subject}
-- Topic: {topic}
-- Difficulty: {difficulty}
-- Do not ask questions similar to these: {previous_questions or "None"}
-{history_info}
-{context_info}
-
-If the question is about a piece of code (e.g., "What is the output of this function?"), you MUST include the code in the "code_snippet" field.
-
-The JSON object must have the following structure. Every value MUST be a JSON string enclosed in double quotes.
+        json_format = """
 {{
   "question": "A question about {topic}",
   "code_snippet": "Optional: A string containing a block of code if the question is about code. Use triple backticks for formatting. Can be null if not applicable.",
@@ -203,8 +217,35 @@ The JSON object must have the following structure. Every value MUST be a JSON st
   "explanation": "A string explaining why the correct answer is right. Any newlines in this string must be escaped as \\\\n."
 }}
 """
+        if difficulty == "socratic":
+            json_format = """
+{{
+  "question": "An open-ended, thought-provoking question about {topic}",
+  "code_snippet": "Optional code block. Can be null.",
+  "options": {{}},
+  "correct": "",
+  "explanation": "What the ideal answer should cover."
+}}
+"""
 
-        system_prompt = """Generate educational multiple choice questions in JSON format only. Be concise."""
+        prompt = f"""You are a JSON generation bot. Your only output is a single, valid JSON object. Do not output any other text.
+Generate a practice question based on these parameters:
+- Subject: {subject}
+- Topic: {topic}
+- Difficulty: {difficulty}
+- Do not ask questions similar to these: {previous_questions or "None"}
+{history_info}
+{context_info}
+
+{difficulty_instructions.get(difficulty, "")}
+
+If the question is about a piece of code, you MUST include the code in the "code_snippet" field.
+
+The JSON object must have the following structure. Every value MUST be a JSON string enclosed in double quotes.
+{json_format}
+"""
+
+        system_prompt = """Generate educational questions in JSON format only. Be concise."""
 
         def _parse_response(raw: str):
             """Clean and parse LLM response; raises on failure."""
@@ -225,17 +266,20 @@ The JSON object must have the following structure. Every value MUST be a JSON st
                 raise ValueError("Missing required keys in question data")
             if not isinstance(data.get("options"), dict):
                 raise ValueError("Options must be a dictionary")
+            
             opts = data["options"]
-            if len(opts) < 3 or len(opts) > 4:
-                raise ValueError(f"Must have 3 or 4 options, got {len(opts)}")
-            correct_key = data.get("correct")
-            if correct_key not in opts:
-                raise ValueError(f"correct must be one of the option keys {list(opts.keys())}")
-            data["correct"] = correct_key
+            if difficulty != "socratic":
+                if len(opts) < 3 or len(opts) > 4:
+                    raise ValueError(f"Must have 3 or 4 options, got {len(opts)}")
+                correct_key = data.get("correct")
+                if correct_key not in opts:
+                    raise ValueError(f"correct must be one of the option keys {list(opts.keys())}")
+                data["correct"] = correct_key
+            
             return data
 
         for attempt in range(2):  # Try up to 2 times (initial + 1 retry)
-            response = self.generate_response(prompt, system_prompt, temperature=0.7, max_tokens=1200)
+            response = await self.generate_response(prompt, system_prompt, temperature=0.7, max_tokens=1200)
 
             # Skip retry if we got a rate-limit or error message instead of JSON
             if response.startswith("Rate limit") or response.startswith("Prompt too long"):
@@ -257,7 +301,7 @@ The JSON object must have the following structure. Every value MUST be a JSON st
                     "message": "We couldn't generate a valid question (the AI returned invalid data). Click **Try again** to generate another question."
                 }
 
-    def explain_concept(
+    async def explain_concept(
         self,
         subject: str,
         topic: str,
@@ -302,9 +346,45 @@ Be clear, encouraging, and educational. Use formatting for readability."""
         system_prompt = """You are a patient, expert tutor who explains concepts clearly.
 Your explanations are well-structured, use examples, and leave students feeling confident they understand."""
 
-        return self.generate_response(prompt, system_prompt, temperature=0.7, max_tokens=1000)
+        return await self.generate_response(prompt, system_prompt, temperature=0.7, max_tokens=1000)
 
-    def evaluate_answer(
+    async def explain_concept_stream(
+        self,
+        subject: str,
+        topic: str,
+        difficulty: str,
+        context: Optional[str] = None
+    ):
+        context_info = ""
+        if context:
+            context_info = f"\n\nReference this context: {context}"
+
+        difficulty_styles = {
+            "beginner": "Explain in very simple terms, as if to someone completely new to the subject. Use analogies and everyday examples.",
+            "intermediate": "Explain with moderate detail, assuming some background knowledge. Include practical applications.",
+            "advanced": "Provide a comprehensive explanation with technical depth, edge cases, and nuanced understanding."
+        }
+
+        prompt = f"""Explain {topic} in {subject} at a {difficulty} level.
+
+{difficulty_styles.get(difficulty, "")}
+{context_info}
+
+Structure your explanation:
+1. Brief definition or overview
+2. Key concepts broken down
+3. Practical example(s)
+4. Common misconceptions or pitfalls (if applicable)
+
+Be clear, encouraging, and educational. Use formatting for readability."""
+
+        system_prompt = """You are a patient, expert tutor who explains concepts clearly.
+Your explanations are well-structured, use examples, and leave students feeling confident they understand."""
+
+        async for chunk in self.generate_response_stream(prompt, system_prompt, temperature=0.7, max_tokens=1000):
+            yield chunk
+
+    async def evaluate_answer(
         self,
         question: str,
         user_answer: str,
@@ -356,7 +436,7 @@ Return ONLY valid JSON:
 Be fair, supportive, and constructive. Help students learn from both correct and incorrect answers.
 Return only valid JSON."""
 
-        response = self.generate_response(prompt, system_prompt, temperature=0.3, max_tokens=150)
+        response = await self.generate_response(prompt, system_prompt, temperature=0.3, max_tokens=150)
 
         # Clean and parse JSON
         response = response.strip().replace("```json", "").replace("```", "").strip()
@@ -386,7 +466,7 @@ Return only valid JSON."""
                 "score": 1.0 if is_correct else 0.0
             }
 
-    def provide_hint(
+    async def provide_hint(
         self,
         question: str,
         options: Dict[str, str],
@@ -421,11 +501,11 @@ Keep the hint to 2-3 sentences."""
         system_prompt = """You are a helpful tutor providing hints.
 Guide students without giving direct answers. Help them develop problem-solving skills."""
 
-        hint = self.generate_response(prompt, system_prompt, temperature=0.7, max_tokens=200)
+        hint = await self.generate_response(prompt, system_prompt, temperature=0.7, max_tokens=200)
         logger.info("✓ Generated hint")
         return hint
 
-    def generate_topic_introduction(
+    async def generate_topic_introduction(
         self,
         subject: str,
         topic: str,
@@ -458,7 +538,7 @@ Keep it concise and friendly."""
 
         system_prompt = "You are an enthusiastic tutor starting a study session. Be warm, encouraging, and brief."
 
-        intro = self.generate_response(prompt, system_prompt, temperature=0.8, max_tokens=200)
+        intro = await self.generate_response(prompt, system_prompt, temperature=0.8, max_tokens=200)
         return intro
 
 # Create singleton instance

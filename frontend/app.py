@@ -17,6 +17,7 @@ from backend.models.question import Interaction, Progress
 from backend.models.material import StudyMaterial
 from backend.services.llm_service import llm_service
 from backend.services.progress_tracker import ProgressTracker
+import asyncio
 from backend.services.material_processor import material_processor
 from config.settings import settings
 from config.security import (
@@ -24,6 +25,19 @@ from config.security import (
     generate_secure_filename, secure_file_deletion, validate_file_size,
     log_security_event, SecurityEvents
 )
+
+def sync_stream_wrapper(async_gen):
+    """Bridge async generators to synchronous Streamlit write_stream"""
+    loop = asyncio.new_event_loop()
+    try:
+        while True:
+            chunk = loop.run_until_complete(async_gen.__anext__())
+            yield chunk
+    except StopAsyncIteration:
+        pass
+    finally:
+        loop.close()
+
 from loguru import logger
 import os
 import uuid
@@ -84,17 +98,61 @@ st.markdown("""
 
 # ===== SESSION STATE INITIALIZATION =====
 
-# Get or create user
+import hashlib
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
 if 'user_id' not in st.session_state:
-    db = SessionLocal()
-    user = db.query(User).first()
-    if not user:
-        user = User(username="default_user")
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    st.session_state.user_id = user.id
-    db.close()
+    st.session_state.user_id = None
+
+if st.session_state.user_id is None:
+    st.title("🔒 Login to AI Learning Tutor")
+    st.write("Please log in or register to track your learning progress.")
+    
+    auth_mode = st.radio("Mode", ["Login", "Register"], horizontal=True)
+    with st.form("auth_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Submit")
+        
+        if submitted:
+            if username and password:
+                db = SessionLocal()
+                user = db.query(User).filter(User.username == username).first()
+                if auth_mode == "Register":
+                    if user:
+                        st.error("Username already exists")
+                    else:
+                        new_user = User(username=username, password_hash=hash_password(password))
+                        db.add(new_user)
+                        db.commit()
+                        db.refresh(new_user)
+                        st.session_state.user_id = new_user.id
+                        st.success("Registered successfully!")
+                        st.rerun()
+                else:
+                    if user and user.password_hash == hash_password(password):
+                        st.session_state.user_id = user.id
+                        st.success("Logged in successfully!")
+                        st.rerun()
+                    elif user and user.password_hash is None:
+                        # Fallback for old default_user without password
+                        st.session_state.user_id = user.id
+                        st.success("Logged in as legacy user!")
+                        st.rerun()
+                    else:
+                        st.error("Invalid username or password")
+                db.close()
+            else:
+                st.error("Please enter both username and password")
+    st.stop()
+    
+# Add logout button to sidebar
+if st.sidebar.button("🚪 Logout"):
+    st.session_state.user_id = None
+    st.session_state.current_session_id = None
+    st.rerun()
 
 # Initialize session state variables
 if 'current_session_id' not in st.session_state:
@@ -273,13 +331,13 @@ def generate_next_question(session_id: int, material_id: int = None, previous_qu
                 context = results[0]['text']
 
         # Generate question using LLM
-        question_data = llm_service.generate_question(
+        question_data = asyncio.run(llm_service.generate_question(
             subject=session.subject,
             topic=session.topic,
             difficulty=session.difficulty_level,
             context=context,
             previous_questions=previous_questions
-        )
+        ))
 
         return question_data
     finally:
@@ -440,7 +498,7 @@ elif page == "📖 Study Session":
                 st.rerun()
 
         with col2:
-            new_diff = st.selectbox("Switch to:", ["beginner", "intermediate", "advanced"], key="new_diff")
+            new_diff = st.selectbox("Switch to:", ["beginner", "intermediate", "advanced", "socratic"], key="new_diff")
             if st.button("Switch Difficulty", use_container_width=True):
                 restart_session(st.session_state.current_session_id, new_diff)
                 st.session_state.questions_asked = 0
@@ -479,7 +537,7 @@ elif page == "📖 Study Session":
 
             difficulty = st.select_slider(
                 "Difficulty Level",
-                options=["beginner", "intermediate", "advanced"],
+                options=["beginner", "intermediate", "advanced", "socratic"],
                 value="beginner",
                 help="Don't worry, you can restart and change this anytime!"
             )
@@ -625,48 +683,47 @@ elif page == "📖 Study Session":
             db.close()
             st.stop()
 
-        # Generate new question if needed
-        if st.session_state.current_question is None:
-            with st.spinner("🤔 Generating question..."):
-                # Fetch previous questions to ensure variety
-                previous_interactions = db.query(Interaction).filter(
-                    Interaction.session_id == st.session_state.current_session_id
-                ).order_by(Interaction.timestamp.desc()).limit(5).all()
-                previous_questions = [inter.question for inter in previous_interactions]
+        @st.fragment
+        def render_question_generation(session_id, material_id):
+            if st.session_state.current_question is None:
+                with st.spinner("🤔 Generating question..."):
+                    db_local = SessionLocal()
+                    # Fetch previous questions to ensure variety
+                    previous_interactions = db_local.query(Interaction).filter(
+                        Interaction.session_id == session_id
+                    ).order_by(Interaction.timestamp.desc()).limit(5).all()
+                    previous_questions = [inter.question for inter in previous_interactions]
 
-                question = generate_next_question(
-                    st.session_state.current_session_id,
-                    st.session_state.selected_material_id,
-                    previous_questions=previous_questions
-                )
+                    question = generate_next_question(
+                        session_id,
+                        material_id,
+                        previous_questions=previous_questions
+                    )
 
-                # If generation failed, show error and retry option (do not store as current_question)
-                if question.get("_generation_failed"):
-                    container.error("⚠️ **Question could not be generated**")
-                    container.markdown(question.get("message", "Something went wrong. Please try again."))
-                    if container.button("🔄 Try again", type="primary", use_container_width=True):
-                        st.rerun()
-                    container.markdown("---")
-                    db.close()
-                    st.stop()
+                    # If generation failed, show error and retry option
+                    if question.get("_generation_failed"):
+                        st.error("⚠️ **Question could not be generated**")
+                        st.markdown(question.get("message", "Something went wrong. Please try again."))
+                        if st.button("🔄 Try again", type="primary", use_container_width=True):
+                            st.rerun(scope="fragment")
+                        st.markdown("---")
+                        db_local.close()
+                        st.stop()
 
-                st.session_state.current_question = question
-                st.session_state.question_start_time = time.time()
-                st.session_state.awaiting_answer = True
-                st.session_state.last_answer_result = None
+                    st.session_state.current_question = question
+                    st.session_state.question_start_time = time.time()
+                    st.session_state.awaiting_answer = True
+                    st.session_state.last_answer_result = None
+                    db_local.close()
+                    st.rerun() # Full rerun to display the question globally
+
+        # Call the fragment
+        render_question_generation(st.session_state.current_session_id, st.session_state.selected_material_id)
 
         # Display question
         question = st.session_state.current_question
 
-        # Guard: if we ever have a failed-question in state, show retry (shouldn't happen after above fix)
-        if question.get("_generation_failed"):
-            container.error("⚠️ **Question could not be generated**")
-            container.markdown(question.get("message", "Something went wrong. Please try again."))
-            if container.button("🔄 Try again", type="primary", use_container_width=True):
-                st.session_state.current_question = None
-                st.rerun()
-            db.close()
-            st.stop()
+
 
         container.write(f"**Question {session.questions_answered + 1} of {settings.QUESTIONS_PER_SESSION}:**")
         container.write(f"### {question['question']}")
@@ -708,70 +765,98 @@ elif page == "📖 Study Session":
 
         # Show answer options if waiting for answer
         elif st.session_state.awaiting_answer:
-            with container.form(key="answer_form"):
-                # Ensure options are sorted alphabetically by key (A, B, C, D) for consistent order
-                try:
-                    sorted_options = sorted(question['options'].items())
-                except (TypeError, AttributeError):
-                    sorted_options = list(question['options'].items() if isinstance(question.get('options'), dict) else [])
-
-                if not sorted_options:
-                    st.error("Question options are invalid or missing. Please try the next question.")
-                else:
-                    option_list = [f"{key}: {text}" for key, text in sorted_options]
-
-                    selected_option_str = st.radio(
-                        "**Select your answer:**",
-                        options=option_list,
-                        index=None,  # No default selection
-                        key="answer_selection"
-                    )
-
-                    submitted = st.form_submit_button("Submit Answer", use_container_width=True, type="primary")
-
-                    if submitted:
-                        if selected_option_str:
-                            with st.spinner("Checking your answer..."):
-                                # Extract key and text from selection
-                                option_key = selected_option_str.split(':', 1)[0]
-                                option_text = selected_option_str.split(':', 1)[1].strip()
-
-                                # Calculate response time
-                                response_time = int(time.time() - st.session_state.question_start_time)
-
-                                # Check if correct (instant for multiple choice)
-                                is_correct = (option_key == question['correct'])
-
-                                # Use instant feedback for correct answers; LLM only for wrong (personalized feedback)
-                                if is_correct:
-                                    evaluation = {
-                                        "is_correct": True,
-                                        "feedback": "Correct! Well done.",
-                                        "score": 1.0
-                                    }
-                                else:
-                                    evaluation = llm_service.evaluate_answer(
-                                        question=question['question'],
-                                        user_answer=option_text,
-                                        correct_answer=question['options'][question['correct']],
-                                        explanation=question['explanation']
-                                    )
-
-                                # Record answer
-                                record_answer(
-                                    st.session_state.current_session_id,
-                                    question,
-                                    option_key,
-                                    is_correct,
-                                    response_time
-                                )
-
-                                # Store result
-                                st.session_state.last_answer_result = evaluation
-                                st.session_state.awaiting_answer = False
+            if session.difficulty_level == "socratic":
+                user_answer = st.chat_input("Explain your reasoning...")
+                if user_answer:
+                    with container:
+                        with st.spinner("Evaluating your response..."):
+                            response_time = int(time.time() - st.session_state.question_start_time)
+                            
+                            evaluation = asyncio.run(llm_service.evaluate_answer(
+                                question=question['question'],
+                                user_answer=user_answer,
+                                correct_answer=question.get('explanation', ''),
+                                explanation=question.get('explanation', '')
+                            ))
+                            
+                            is_correct = evaluation['is_correct']
+                            
+                            record_answer(
+                                st.session_state.current_session_id,
+                                question,
+                                user_answer,
+                                is_correct,
+                                response_time
+                            )
+                            
+                            st.session_state.last_answer_result = evaluation
+                            st.session_state.awaiting_answer = False
                             st.rerun()
-                        else:
-                            st.warning("Please select an answer before submitting.", icon="⚠️")
+            else:
+                with container.form(key="answer_form"):
+                    # Ensure options are sorted alphabetically by key (A, B, C, D) for consistent order
+                    try:
+                        sorted_options = sorted(question['options'].items())
+                    except (TypeError, AttributeError):
+                        sorted_options = list(question['options'].items() if isinstance(question.get('options'), dict) else [])
+    
+                    if not sorted_options:
+                        st.error("Question options are invalid or missing. Please try the next question.")
+                    else:
+                        option_list = [f"{key}: {text}" for key, text in sorted_options]
+    
+                        selected_option_str = st.radio(
+                            "**Select your answer:**",
+                            options=option_list,
+                            index=None,  # No default selection
+                            key="answer_selection"
+                        )
+    
+                        submitted = st.form_submit_button("Submit Answer", use_container_width=True, type="primary")
+    
+                        if submitted:
+                            if selected_option_str:
+                                with st.spinner("Checking your answer..."):
+                                    # Extract key and text from selection
+                                    option_key = selected_option_str.split(':', 1)[0]
+                                    option_text = selected_option_str.split(':', 1)[1].strip()
+    
+                                    # Calculate response time
+                                    response_time = int(time.time() - st.session_state.question_start_time)
+    
+                                    # Check if correct (instant for multiple choice)
+                                    is_correct = (option_key == question['correct'])
+    
+                                    # Use instant feedback for correct answers; LLM only for wrong (personalized feedback)
+                                    if is_correct:
+                                        evaluation = {
+                                            "is_correct": True,
+                                            "feedback": "Correct! Well done.",
+                                            "score": 1.0
+                                        }
+                                    else:
+                                        evaluation = asyncio.run(llm_service.evaluate_answer(
+                                            question=st.session_state.current_question['question'],
+                                            user_answer=option_text,
+                                            correct_answer=question['options'][question['correct']],
+                                            explanation=question['explanation']
+                                        ))
+    
+                                    # Record answer
+                                    record_answer(
+                                        st.session_state.current_session_id,
+                                        question,
+                                        option_key,
+                                        is_correct,
+                                        response_time
+                                    )
+    
+                                    # Store result
+                                    st.session_state.last_answer_result = evaluation
+                                    st.session_state.awaiting_answer = False
+                                st.rerun()
+                            else:
+                                st.warning("Please select an answer before submitting.", icon="⚠️")
 
             container.markdown("---")
 
@@ -779,21 +864,23 @@ elif page == "📖 Study Session":
             col1, col2 = container.columns(2)
             with col1:
                 if st.button("💡 Get a Hint", use_container_width=True):
-                    hint = llm_service.provide_hint(
-                        question['question'],
-                        question['options'],
-                        question['correct']
-                    )
+                    hint = asyncio.run(llm_service.provide_hint(
+                        question=st.session_state.current_question['question'],
+                        options=st.session_state.current_question['options'],
+                        correct_answer=st.session_state.current_question['correct']
+                    ))
                     st.info(f"**Hint:** {hint}")
 
             with col2:
                 if st.button("❓ Explain Topic", use_container_width=True):
-                    explanation = llm_service.explain_concept(
-                        session.subject,
-                        session.topic,
-                        session.difficulty_level
-                    )
-                    st.info(explanation)
+                    # We use an empty container to hold the streamed text, or just write_stream directly inside an info box
+                    with st.info(""):
+                        st.write_stream(sync_stream_wrapper(llm_service.explain_concept_stream(
+                            subject=session.subject,
+                            topic=session.topic,
+                            difficulty=session.difficulty_level,
+                            context=None
+                        )))
 
         container.markdown('</div>', unsafe_allow_html=True)
         db.close()
@@ -1000,6 +1087,42 @@ elif page == "📊 Progress Dashboard":
         with col4:
             mastery_rate = (progress_data['topics_mastered'] / progress_data['topics_started'] * 100) if progress_data['topics_started'] > 0 else 0
             st.metric("Mastery Rate", f"{mastery_rate:.0f}%")
+
+        # Feature 2: Flashcard Export
+        st.markdown("---")
+        st.subheader("📇 Export Flashcards")
+        st.write(f"Download your incorrect questions for '{selected_subject}' as a CSV to import into Anki or Quizlet.")
+        
+        # Get incorrect interactions for this subject
+        incorrect_interactions = db.query(Interaction).join(SessionModel).filter(
+            SessionModel.user_id == st.session_state.user_id,
+            SessionModel.subject == selected_subject,
+            Interaction.is_correct == False
+        ).all()
+        
+        if not incorrect_interactions:
+            st.info("You don't have any incorrect questions to review. Great job!")
+        else:
+            import csv
+            import io
+            
+            output = io.StringIO()
+            writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
+            writer.writerow(["Front (Question)", "Back (Answer & Explanation)"])
+            
+            for inter in incorrect_interactions:
+                front = inter.question
+                # We need the explanation which is typically stored in the options/correct_answer, but since we didn't store the LLM explanation directly in Interaction, we'll format what we have.
+                back = f"Correct Answer: {inter.correct_answer}"
+                writer.writerow([front, back])
+                
+            csv_data = output.getvalue()
+            st.download_button(
+                label="📥 Download Flashcards (CSV)",
+                data=csv_data,
+                file_name=f"{selected_subject.replace(' ', '_').lower()}_flashcards.csv",
+                mime="text/csv"
+            )
 
         st.markdown("---")
 

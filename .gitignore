@@ -115,3 +115,22 @@ data/*
 !data/.gitkeep
 data/uploads/*
 !data/uploads/.gitkeep
+
+# AI Agent & Planning
+.planning/
+AI_TASKS.md
+PROJECT.md
+PLAN.md
+UI-SPEC.md
+*.gemini/
+
+# Cursor / VSCode / IDEs
+.cursor/
+.cursorrules
+.vscode/
+
+# Additional Caches
+.pytest_cache/
+.coverage
+__pycache__/
+*.pyc
