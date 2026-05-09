@@ -18,6 +18,9 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 # Every table will inherit from this
 Base = declarative_base()
 
+from contextlib import contextmanager
+
+@contextmanager
 def get_db():
     """
     Creates a database session for each request.
