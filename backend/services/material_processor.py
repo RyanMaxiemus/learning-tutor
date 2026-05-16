@@ -8,6 +8,7 @@ from sentence_transformers import SentenceTransformer
 import chromadb
 from config.settings import settings
 from loguru import logger
+from config.security import SecurityConfig
 
 class MaterialProcessor:
     """
@@ -16,13 +17,24 @@ class MaterialProcessor:
     """
 
     def __init__(self):
-        # Initialize text embedding model (converts text to numbers for searching)
-        logger.info("Loading embedding model...")
-        self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
-
-        # Initialize vector database (stores searchable text)
-        self.chroma_client = chromadb.PersistentClient(path=settings.CHROMA_PERSIST_DIR)
+        self._embedder = None
+        self._chroma_client = None
         logger.info("✓ Material processor initialized")
+
+    @property
+    def chroma_client(self):
+        if self._chroma_client is None:
+            # Initialize vector database (stores searchable text)
+            self._chroma_client = chromadb.PersistentClient(path=settings.CHROMA_PERSIST_DIR)
+        return self._chroma_client
+
+    @property
+    def embedder(self):
+        if self._embedder is None:
+            # Initialize text embedding model (converts text to numbers for searching)
+            logger.info("Loading embedding model...")
+            self._embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        return self._embedder
 
     def calculate_file_hash(self, file_path: Path) -> str:
         """
@@ -148,10 +160,19 @@ class MaterialProcessor:
         words = text.split()
         chunks = []
 
-        for i in range(0, len(words), chunk_size - overlap):
+        if chunk_size <= overlap:
+            raise ValueError("chunk_size must be greater than overlap")
+
+        step = chunk_size - overlap
+        for i in range(0, len(words), step):
             chunk = ' '.join(words[i:i + chunk_size])
             if chunk.strip():
                 chunks.append(chunk)
+                if len(chunks) >= SecurityConfig.MAX_CHUNKS_PER_DOCUMENT:
+                    logger.warning(
+                        f"Chunk limit reached ({SecurityConfig.MAX_CHUNKS_PER_DOCUMENT}); truncating remaining text"
+                    )
+                    break
 
         logger.info(f"Created {len(chunks)} chunks from text")
         return chunks
@@ -251,7 +272,8 @@ class MaterialProcessor:
 
         except Exception as e:
             logger.error(f"Material processing error: {e}")
-            return {"error": str(e)}
+            # Avoid leaking internal details to UI
+            return {"error": "Failed to process material. Please try a different file."}
 
     def search_material(
         self,

@@ -248,7 +248,7 @@ The JSON object must have the following structure. Every value MUST be a JSON st
         system_prompt = """Generate educational questions in JSON format only. Be concise."""
 
         def _parse_response(raw: str):
-            """Clean and parse LLM response; raises on failure."""
+            """Clean and parse LLM response; raises on failure (strict)."""
             text = raw.strip()
             if text.startswith("```json"):
                 text = text[7:]
@@ -257,13 +257,14 @@ The JSON object must have the following structure. Every value MUST be a JSON st
             if text.endswith("```"):
                 text = text[:-3]
             text = text.strip()
-            if not text.endswith('}'):
-                if text.count('{') > text.count('}'):
-                    text += '}'
             data = json.loads(text)
             required_keys = ["question", "options", "correct", "explanation"]
             if not all(key in data for key in required_keys):
                 raise ValueError("Missing required keys in question data")
+            if not isinstance(data.get("question"), str) or not data["question"].strip():
+                raise ValueError("question must be a non-empty string")
+            if not isinstance(data.get("explanation"), str):
+                raise ValueError("explanation must be a string")
             if not isinstance(data.get("options"), dict):
                 raise ValueError("Options must be a dictionary")
             
@@ -271,10 +272,22 @@ The JSON object must have the following structure. Every value MUST be a JSON st
             if difficulty != "socratic":
                 if len(opts) < 3 or len(opts) > 4:
                     raise ValueError(f"Must have 3 or 4 options, got {len(opts)}")
+                allowed_keys = {"A", "B", "C", "D"}
+                if any(k not in allowed_keys for k in opts.keys()):
+                    raise ValueError("options keys must be A-D")
+                if any(not isinstance(v, str) for v in opts.values()):
+                    raise ValueError("options values must be strings")
                 correct_key = data.get("correct")
                 if correct_key not in opts:
                     raise ValueError(f"correct must be one of the option keys {list(opts.keys())}")
                 data["correct"] = correct_key
+            else:
+                # Socratic: options should be empty dict and correct empty string (tolerate missing but normalize)
+                if not isinstance(opts, dict):
+                    raise ValueError("options must be a dictionary")
+                data["options"] = {}
+                if not isinstance(data.get("correct"), str):
+                    data["correct"] = ""
             
             return data
 

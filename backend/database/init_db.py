@@ -15,22 +15,8 @@ def setup_database():
     # Create all tables
     init_db()
 
-    # Create default user if not exists
-    db = SessionLocal()
-    try:
-        existing_user = db.query(User).filter(User.username == "default_user").first()
-        if not existing_user:
-            default_user = User(username="default_user")
-            db.add(default_user)
-            db.commit()
-            print("✓ Default user created.")
-        else:
-            print("✓ Default user already exists.")
-    except Exception as e:
-        print(f"Error during setup: {e}")
-        db.rollback()
-    finally:
-        db.close()
+    # NOTE: We intentionally do NOT create a passwordless default user.
+    # Users should register via the Streamlit UI so their password is properly hashed.
 
 
 if __name__ == "__main__":

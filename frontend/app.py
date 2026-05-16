@@ -19,6 +19,9 @@ from backend.services.llm_service import llm_service
 from backend.services.progress_tracker import ProgressTracker
 import asyncio
 from backend.services.material_processor import material_processor
+from frontend.async_utils import run_async, sync_stream
+from frontend.ui_state import init_session_state
+from frontend.pages.auth import render_auth_gate
 from config.settings import settings
 from config.security import (
     SecurityConfig, validate_file_content, sanitize_input,
@@ -26,25 +29,16 @@ from config.security import (
     log_security_event, SecurityEvents
 )
 
-def sync_stream_wrapper(async_gen):
-    """Bridge async generators to synchronous Streamlit write_stream"""
-    loop = asyncio.new_event_loop()
-    try:
-        while True:
-            chunk = loop.run_until_complete(async_gen.__anext__())
-            yield chunk
-    except StopAsyncIteration:
-        pass
-    finally:
-        loop.close()
-
 from loguru import logger
 import os
 import uuid
 import re
 
+# ===== SESSION STATE INITIALIZATION =====
+init_session_state()
+
 # Initialize database on first run (only once per session)
-if 'db_initialized' not in st.session_state:
+if not st.session_state.db_initialized:
     init_db()
     st.session_state.db_initialized = True
 
@@ -96,57 +90,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ===== SESSION STATE INITIALIZATION =====
-
-import hashlib
-
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
-if 'user_id' not in st.session_state:
-    st.session_state.user_id = None
-
-if st.session_state.user_id is None:
-    st.title("🔒 Login to AI Learning Tutor")
-    st.write("Please log in or register to track your learning progress.")
-    
-    auth_mode = st.radio("Mode", ["Login", "Register"], horizontal=True)
-    with st.form("auth_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Submit")
-        
-        if submitted:
-            if username and password:
-                db = SessionLocal()
-                user = db.query(User).filter(User.username == username).first()
-                if auth_mode == "Register":
-                    if user:
-                        st.error("Username already exists")
-                    else:
-                        new_user = User(username=username, password_hash=hash_password(password))
-                        db.add(new_user)
-                        db.commit()
-                        db.refresh(new_user)
-                        st.session_state.user_id = new_user.id
-                        st.success("Registered successfully!")
-                        st.rerun()
-                else:
-                    if user and user.password_hash == hash_password(password):
-                        st.session_state.user_id = user.id
-                        st.success("Logged in successfully!")
-                        st.rerun()
-                    elif user and user.password_hash is None:
-                        # Fallback for old default_user without password
-                        st.session_state.user_id = user.id
-                        st.success("Logged in as legacy user!")
-                        st.rerun()
-                    else:
-                        st.error("Invalid username or password")
-                db.close()
-            else:
-                st.error("Please enter both username and password")
-    st.stop()
+# Auth gate (stops if not logged in)
+render_auth_gate()
     
 # Add logout button to sidebar
 if st.sidebar.button("🚪 Logout"):
@@ -154,38 +99,12 @@ if st.sidebar.button("🚪 Logout"):
     st.session_state.current_session_id = None
     st.rerun()
 
-# Initialize session state variables
-if 'current_session_id' not in st.session_state:
-    st.session_state.current_session_id = None
-
-if 'current_question' not in st.session_state:
-    st.session_state.current_question = None
-
-if 'question_start_time' not in st.session_state:
-    st.session_state.question_start_time = None
-
-if 'questions_asked' not in st.session_state:
-    st.session_state.questions_asked = 0
-
-if 'selected_material_id' not in st.session_state:
-    st.session_state.selected_material_id = None
-
-if 'awaiting_answer' not in st.session_state:
-    st.session_state.awaiting_answer = False
-
-if 'last_answer_result' not in st.session_state:
-    st.session_state.last_answer_result = None
-
 # ===== SIDEBAR NAVIGATION =====
 
 st.sidebar.title("📚 AI Learning Tutor")
 st.sidebar.markdown("---")
 
-# Unified page navigation state
-if 'page' not in st.session_state:
-    st.session_state.page = "🏠 Home"
-
-page_options = ["🏠 Home", "📖 Study Session", "📚 Study Materials", "📊 Progress Dashboard", "⚙️ Settings"]
+page_options = ["🏠 Home", "📖 Study Session", "📚 Study Materials", "📊 Progress Dashboard", "🗓️ Review Queue", "⚙️ Settings"]
 
 # The radio button's state is directly tied to `st.session_state.page`.
 # This is the single source of truth for the current page.
@@ -331,7 +250,7 @@ def generate_next_question(session_id: int, material_id: int = None, previous_qu
                 context = results[0]['text']
 
         # Generate question using LLM
-        question_data = asyncio.run(llm_service.generate_question(
+        question_data = run_async(llm_service.generate_question(
             subject=session.subject,
             topic=session.topic,
             difficulty=session.difficulty_level,
@@ -525,12 +444,14 @@ elif page == "📖 Study Session":
         with col1:
             subject = st.text_input(
                 "Subject",
+                value=st.session_state.get("prefill_subject", ""),
                 placeholder="e.g., Python Programming, Spanish, AWS Certification",
                 help="What do you want to learn?"
             )
 
             topic = st.text_input(
                 "Topic",
+                value=st.session_state.get("prefill_topic", ""),
                 placeholder="e.g., Control Flow, Past Tense, S3 Security",
                 help="Specific topic within the subject"
             )
@@ -772,7 +693,7 @@ elif page == "📖 Study Session":
                         with st.spinner("Evaluating your response..."):
                             response_time = int(time.time() - st.session_state.question_start_time)
                             
-                            evaluation = asyncio.run(llm_service.evaluate_answer(
+                            evaluation = run_async(llm_service.evaluate_answer(
                                 question=question['question'],
                                 user_answer=user_answer,
                                 correct_answer=question.get('explanation', ''),
@@ -835,7 +756,7 @@ elif page == "📖 Study Session":
                                             "score": 1.0
                                         }
                                     else:
-                                        evaluation = asyncio.run(llm_service.evaluate_answer(
+                                        evaluation = run_async(llm_service.evaluate_answer(
                                             question=st.session_state.current_question['question'],
                                             user_answer=option_text,
                                             correct_answer=question['options'][question['correct']],
@@ -864,7 +785,7 @@ elif page == "📖 Study Session":
             col1, col2 = container.columns(2)
             with col1:
                 if st.button("💡 Get a Hint", use_container_width=True):
-                    hint = asyncio.run(llm_service.provide_hint(
+                    hint = run_async(llm_service.provide_hint(
                         question=st.session_state.current_question['question'],
                         options=st.session_state.current_question['options'],
                         correct_answer=st.session_state.current_question['correct']
@@ -875,7 +796,7 @@ elif page == "📖 Study Session":
                 if st.button("❓ Explain Topic", use_container_width=True):
                     # We use an empty container to hold the streamed text, or just write_stream directly inside an info box
                     with st.info(""):
-                        st.write_stream(sync_stream_wrapper(llm_service.explain_concept_stream(
+                        st.write_stream(sync_stream(llm_service.explain_concept_stream(
                             subject=session.subject,
                             topic=session.topic,
                             difficulty=session.difficulty_level,
@@ -917,29 +838,31 @@ elif page == "📚 Study Materials":
             st.error("❌ Invalid characters in subject name. Please use only letters, numbers, and spaces.")
         elif st.button("📥 Process and Upload", type="primary"):
             with st.spinner("Processing document... This may take a moment."):
-                # Sanitize filename to prevent path traversal
-                import os
                 safe_filename = os.path.basename(uploaded_file.name)
-                # Generate random filename to prevent conflicts and improve security
-                import uuid
                 file_extension = Path(safe_filename).suffix.lower()
-                random_filename = f"{uuid.uuid4()}{file_extension}"
+                random_filename = generate_secure_filename(safe_filename)
                 file_path = settings.UPLOADS_DIR / random_filename
 
                 # Validate file size (max 100MB)
-                if len(uploaded_file.getbuffer()) > 100 * 1024 * 1024:
+                file_size = getattr(uploaded_file, "size", None)
+                if file_size is None:
+                    file_size = len(uploaded_file.getbuffer())
+                if not validate_file_size(file_size, SecurityConfig.MAX_FILE_SIZE_MB):
                     st.error("❌ File too large. Maximum size is 100MB.")
                     st.stop()
 
                 # Validate file type by content, not just extension
-                file_content = uploaded_file.getbuffer()
-                if not validate_file_content(file_content, file_extension):
+                # Only read the first 8 bytes for magic-byte checks (avoids buffering the whole file twice)
+                uploaded_file.seek(0)
+                header = uploaded_file.read(8)
+                uploaded_file.seek(0)
+                if not validate_file_content(header, file_extension):
                     st.error("❌ Invalid file type or corrupted file.")
                     st.stop()
 
                 # Save uploaded file
                 with open(file_path, 'wb') as f:
-                    f.write(file_content)
+                    f.write(uploaded_file.getbuffer())
 
                 # Calculate hash
                 file_hash = material_processor.calculate_file_hash(file_path)
@@ -953,7 +876,7 @@ elif page == "📚 Study Materials":
 
                 if existing:
                     st.warning(f"⚠️ This file appears to be a duplicate of '{existing.original_filename}'")
-                    file_path.unlink()  # Delete duplicate
+                    secure_file_deletion(file_path)
                 else:
                     # Create database record
                     material = StudyMaterial(
@@ -1203,6 +1126,12 @@ elif page == "📊 Progress Dashboard":
                     st.write("✅ Complete")
 
     db.close()
+
+# ===== PAGE: REVIEW QUEUE =====
+
+elif page == "🗓️ Review Queue":
+    from frontend.pages.review_queue import render_review_queue
+    render_review_queue()
 
 # ===== PAGE: SETTINGS =====
 

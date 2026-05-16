@@ -29,3 +29,6 @@ chromadb>=0.4.0
 # Utilities
 python-dotenv>=1.0.0
 loguru>=0.7.2
+
+# Security
+argon2-cffi>=25.0.0
