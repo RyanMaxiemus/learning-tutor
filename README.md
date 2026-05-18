@@ -1,4 +1,4 @@
-# 📚 AI Learning Tutor
+# 📚 Learning Tutor AI
 
 > An intelligent, adaptive learning assistant that transforms any subject into a personalized curriculum, powered by local LLMs via Ollama.
 
