@@ -1,3 +1,5 @@
+[![Need a Full-Stack AI Dev? Let's talk.](https://img.shields.io/badge/Need%20a%20Full--Stack%20AI%20Dev%3F%20Let%27s%20talk.-%231E90FF?style=for-the-badge&logo=github&logoColor=white)](https://linkedin.com/in/RyanMaxie)
+
 # 📚 Learning Tutor AI
 
 > An intelligent, adaptive learning assistant that transforms any subject into a personalized curriculum, powered by local LLMs via Ollama.
